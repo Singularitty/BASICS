@@ -4,7 +4,7 @@ Model Checking tool to verify LTL properties in stack memory of binary programs
 # Requirements
 
 ## Recomended
-- Use PyPy for better performance
+- PyPy is necessary to obtain better performance, we recommend setting a virtualenv with pyenv, using the PyPy Interpreter
 
 ## Python Packages
 - angr
