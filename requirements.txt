@@ -1,0 +1,11 @@
+angr==9.2.102
+angr_utils==0.5.0
+capstone==5.0.0.post1
+claripy==9.2.102
+cle==9.2.102
+lark==1.1.9
+nose==1.3.7
+numpy==2.0.1
+Pillow==10.4.0
+pwntools==4.12.0
+rustworkx==0.14.2
