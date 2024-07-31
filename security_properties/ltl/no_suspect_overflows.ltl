@@ -1,0 +1,4 @@
+ []!(($exists_stack s: exists_buffer s, b: (byte(s, end(buffer(s, b))) = Occupied && 
+                                            byte(s, end(buffer(s, b)) - 3 ) = Occupied && 
+                                            byte(s, end(buffer(s, b)) - 2 ) = Modified && 
+                                            byte(s, end(buffer(s, b)) - 1) = Modified)$))

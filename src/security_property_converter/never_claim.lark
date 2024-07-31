@@ -1,0 +1,23 @@
+// lark grammar for parsing promela never claims
+
+start: "never" "{" state* "}"
+
+state: state_label ":" (("if" transition+ "fi" ";") | "skip")
+
+transition: "::" condition "->" "goto" target_state
+
+condition: /[^->]+/  // Capture the text of the condition
+
+state_label: IDENTIFIER
+target_state: IDENTIFIER
+
+// Identifiers
+%import common.CNAME -> IDENTIFIER
+
+// Comments
+COMMENT: "/*" /.*?/s "*/"
+%ignore COMMENT
+
+// Whitespace
+%import common.WS
+%ignore WS
