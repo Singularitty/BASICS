@@ -1,0 +1,1 @@
+[]!($exists_stack s: byte(s, 15) = Modified && byte(s,14) = Critical$)

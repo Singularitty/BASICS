@@ -1,0 +1,22 @@
+[
+    {
+        "property" : "rip_integrity",
+        "vulnerability" : ["CWE-121"]
+    },
+    {
+        "property" : "rbp_integrity",
+        "vulnerability" : ["CWE-121"]
+    },
+    {
+        "property" : "no_off_by_one_underflows_loops",
+        "vulnerability" : ["CWE-124"]
+    },
+    {
+        "property" : "no_off_by_one_underflows_clib",
+        "vulnerability" : ["CWE-124"]
+    },
+    {
+        "property" : "no_gets_usage",
+        "vulnerability" : ["CWE-121"]
+    }
+]

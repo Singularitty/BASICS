@@ -1,0 +1,18 @@
+[
+    {
+        "vulnerability" : "CWE-121",
+        "description" : "Stack-based Buffer Overflow"
+    },
+    {
+        "vulnerability" : "CWE-787",
+        "description" : "Out-of-bounds Write"
+    },
+    {
+        "vulnerability" : "CWE-124",
+        "description" : "Buffer Underwrite"
+    },
+    {
+        "vulnerability" : "CWE-193",
+        "description" : "Off-by-one Error"
+    }
+]

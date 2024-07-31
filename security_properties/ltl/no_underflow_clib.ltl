@@ -1,0 +1,3 @@
+ []!($previous_transition() = call_strcpy || previous_transition() = call_scanf || previous_transition() = call_strcat$ V (<>($exists_stack s: exists_buffer s, b: (byte(s, start(buffer(s, b)) + 1) = Occupied && 
+                                           byte(s, start(buffer(s, b))) = Occupied && 
+                                           byte(s, start(buffer(s, b)) + 2) != Occupied)$)))

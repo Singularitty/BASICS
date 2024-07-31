@@ -1,0 +1,9 @@
+[] ($forall_stack x: (byte(stack(x), 8) = Critical && 
+                byte(stack(x), 9) = Critical && 
+                byte(stack(x), 10) = Critical && 
+                byte(stack(x), 11) = Critical && 
+                byte(stack(x), 12) = Critical && 
+                byte(stack(x), 13) = Critical && 
+                byte(stack(x), 14) = Critical && 
+                byte(stack(x), 15) = Critical)$)
+

@@ -1,0 +1,45 @@
+start: expr
+
+?expr: expr "||" term           -> or_expr
+     | term
+
+?term: term "&&" factor        -> and_expr
+     | factor
+
+?factor: "!" atom             -> not_expr
+       | comparison
+       | quantifier
+
+?comparison: atom comparator atom -> comparison_expr
+           | atom
+
+?atom: "True"                   -> true
+     | "False"                  -> false
+     | NAME                     
+     | NUMBER
+     | function_call
+     | "(" expr ")"
+
+?quantifier: "forall_stack" NAME ":" expr -> forall_stack_expr
+           | "exists_stack" NAME ":" expr -> exists_stack_expr
+           | "forall_buffer" NAME "," NAME ":" expr -> forall_buffer_expr
+           | "exists_buffer" NAME "," NAME ":" expr -> exists_buffer_expr
+
+function_call: NAME "(" [args] ")"
+args: (expr ("," expr)*)?
+
+comparator: "=" -> eq 
+          | "!=" -> neq
+          | "<"  -> lt
+          | "<=" -> le
+          | ">"  -> gt
+          | ">=" -> ge
+          | "-"  -> minus
+          | "+"  -> plus
+          | "*"  -> times
+          | "/"  -> div
+
+%import common.CNAME -> NAME
+%import common.NUMBER -> NUMBER
+%import common.WS
+%ignore WS
