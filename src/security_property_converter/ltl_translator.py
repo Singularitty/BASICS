@@ -114,7 +114,7 @@ class LogicTransformer(lark.Transformer):
         variable_stack = args[0]
         variable_buffer = args[1]
         expression = args[2]
-        return {"FORALL_BUFFER": {"stack": variable_stack, "buffer": variable_buffer, "expression": expression}}
+        return {"EXISTS_BUFFER": {"stack": variable_stack, "buffer": variable_buffer, "expression": expression}}
     
     def eq(self, _):
         return "=="
