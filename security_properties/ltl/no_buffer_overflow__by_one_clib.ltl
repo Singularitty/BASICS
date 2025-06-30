@@ -1,0 +1,1 @@
+ [](NOT$previous_transition() = call_strcpy || previous_transition() = call_scanf || previous_transition() = call_strcat$ || (NOT($exists_stack s: exists_buffer s, b: (byte(s, end(buffer(s, b))) = Occupied  && byte(s, end(buffer(s, b)) - 1) = Modified) $)))
