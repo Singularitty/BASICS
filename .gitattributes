@@ -1,0 +1,2 @@
+# Avoid github thinking this is a C project because of stdlib
+src/vulnerability_identifier_removel/patches/stdlib.c linguist-vendored=true
