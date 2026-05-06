@@ -1,0 +1,100 @@
+Reviewer: 1
+
+This paper presents BASICS: Binary Analysis and Stack Integrity Checker System for Buffer Overflow Mitigation.
+
+Thank you for submitting such a well written and carefully organized paper. It systematically guides the reader through the creation of the BASICS tool.
+
+The work's focus is on identifying and patching buffer overflows (BoFs) in binary programs through a static analysis that integrates model checking with concolic execution.
+
+The paper begins with a few sentences about cyber-physical systems, but never provides a linkage between BASICS and CPS other than the fact that the C programming language is used in CPS and BASICS addresses BoFs in C program binaries. The paper may be better served by making its application more generic.
+
+Expansion of the section discussing the creation LTL formulas and their conversion to ω-automata would be helpful.
+
+A more rigorous comparison of BASICS with previous work would improve the presentation. How does BASICS compare with earlier work, viz., CWE_Checker, for BoF identification in terms of the size of the target code and the time required for buffer overflow patching? Tables 4 and 5 provide some information but they need to be expanded upon. Do BASICS and CWE_Checker identify the same BoF vulnerabilities? Are the BASICS results a subset of those from CWE_Checker? How does BASICS improve upon the work of Chen et al.?
+
+Will the tools developed in this work be made available to other researchers? If so, how?
+
+Minor problems
+Some of the citations in the paper and their corresponding references need to be fixed. These include, for example:
+Introduction
+One, 1966
+Department, 2023
+Vadayath
+
+Reference to appendix is given as Appendix(??) in Section 9 in the manuscript
+
+
+
+
+
+
+Reviewer: 2
+
+This manuscript presents BASICS (Binary Analysis and Stack Integrity Checker System), a framework for automated stack buffer overflow (BO) detection and mitigation in compiled C binaries via model checking, concolic execution, and trampoline-based binary patching. While the work addresses a long-standing security challenge aligned with the scope of *Computers & Security*, it contains severe, fundamental flaws in theoretical rigor, novelty justification, experimental design, and limitation analysis that prevent it from meeting the publication standards of this top-tier journal. Detailed critical issues and revision requirements are outlined below.
+
+
+## Major Critical Issues (Mandatory to Address)
+### 1. Insufficient Justification of Novelty and Marginal Contribution
+The manuscript fails to clearly articulate the incremental and unique contributions of this work relative to the state of the art, a core requirement for publication in *Computers & Security*.
+- The related work section (Section 10) provides only fragmented, superficial reviews of existing research, with no systematic, side-by-side comparison between BASICS and representative prior works (e.g., CBMC, MOPS, Arbiter, Vyper, E9Patch-based automated patching frameworks) across core dimensions such as analysis level, detection-repair integration, formal verification capability, supported architectures, and vulnerability coverage. This leaves reviewers unable to objectively assess the marginal value of the proposed work.
+- The theoretical novelty of core technical designs is not rigorously justified. The manuscript only states that existing model checkers fail to meet the requirements for binary stack memory analysis, but does not elaborate on the theoretical breakthroughs of the proposed MemStaCe model over state-of-the-art binary memory modeling schemes. Similarly, the custom LTL security properties and extended operators are only defined with descriptive text, with no explanation of their targeted improvements over existing temporal logic-based security property specifications for software, especially for source-free binary scenarios.
+- The manuscript lacks tracking of cutting-edge research in the field. The reference list is dominated by classic pre-2010 works, with very limited citations of the latest relevant research from top security venues (IEEE S&P, ACM CCS, USENIX Security, and this journal) published between 2023 and 2025, failing to demonstrate the authors' comprehensive grasp of the latest advances in binary security and formal verification.
+
+### 2. Lack of Rigor in Formalization and Theoretical Foundation
+As a work centered on model checking and formal verification, the manuscript has critical gaps in formal definition, semantic rigor, and correctness proof, which undermine the theoretical basis of the entire framework.
+- The formal definition of the core MemStaCe model is incomplete. Section 4.1 only defines the LTS triple (S, Γ, T) of MemStaCe, but provides no strict formal semantics for the transition relation T. The pre/post conditions and state transition rules for direct/indirect memory transition operators and RWrite/nRWrite byte transition operators are not formally specified, only described via intuitive examples and a simplified automaton diagram.
+- The semantics of custom extended LTL operators are undefined, and the core formulas contain syntax errors. The extended LTL operators in Table 2 only have descriptive explanations, with no strict formal definition based on standard LTL semantics, which cannot guarantee the consistency and correctness of the operators.
+- There is no proof of soundness and completeness for the core logic. The manuscript's core claim is that "a violation of LTL properties in MemStaCe is equivalent to the existence of a BO vulnerability", yet it provides no proof of the soundness (if an LTL violation is detected, a corresponding BO vulnerability must exist) and completeness (if a BO vulnerability exists, a corresponding LTL violation must be detected in MemStaCe) of this conclusion. This is the fundamental theoretical basis of a formal verification paper, and its absence calls into question the theoretical rationality of the entire framework.
+- The theoretical limitations of loop processing are unstated. The manuscript uses a user-defined maximum iteration count for loop processing, which is essentially Bounded Model Checking (BMC). However, it neither declares this technical nature nor discusses the incompleteness introduced by BMC—BO vulnerabilities in loops exceeding the maximum iteration count cannot be detected, deliberately avoiding a core theoretical limitation.
+- There is a critical technical gap in the handling of user-defined functions. The manuscript only discusses the simulation and modeling of C standard library functions, and completely fails to address the processing of user-defined functions, nested function calls, and recursive calls. BO vulnerabilities in real-world programs are widely present in user-defined functions, which severely limits the applicability of the proposed scheme.
+
+### 3. Critical Flaws in Experimental Design and Validation
+The experimental design has multiple fatal flaws that prevent the manuscript from sufficiently validating the effectiveness and superiority of the BASICS framework.
+- Unfair comparison on the Juliet dataset. The manuscript excluded 532 instances (≈15% of the total dataset) due to timeouts, and only tested on the remaining 3010 instances, yet compared the results with CWE Checker, which processed all 3542 instances. This unequal comparison baseline makes the results unconvincing.
+- Overly limited selection of baseline tools. The manuscript only compares BASICS with CWE Checker, and does not include mainstream state-of-the-art binary vulnerability detection tools (e.g., Angr's built-in vulnerability detection module, Ghidra's CWE detection plugin, Vyper) or representative binary automated patching frameworks. This makes it impossible to prove the performance and effectiveness advantages of BASICS.
+- Overly lenient validation criteria for patch effectiveness. The core requirements for automated patching are complete vulnerability remediation and functional equivalence preservation with the original program. However, the manuscript only uses "crash-inducing inputs no longer trigger a crash" as the criterion for successful patching, and completely fails to verify the functional equivalence of the patched program and the original program under normal inputs. The altered program behavior caused by sprintf patches is only mentioned in passing, with no root cause analysis or impact assessment, which does not meet the academic norms of the automated program repair field.
+- Insufficient root cause analysis of false positives and false negatives. The manuscript only superficially attributes 60 false positives and 1282 false negatives on the Juliet dataset to inaccurate symbolic execution and flawed state space modeling, with no categorical statistics, in-depth root cause analysis, or corresponding improvement plans.
+- A serious disconnect between real-world validation and the problem statement in the introduction. The introduction emphasizes the application requirements of Cyber-Physical Systems (CPS) scenarios, but the real-world program testing only includes 6 ultra-small programs with a maximum of 261 lines of code, completely failing to cover industrial control firmware, RTOS programs, and medium-to-large embedded binaries commonly used in CPS scenarios. In addition, the analysis of the 203-line Hash-Map program took 759 seconds and timed out, with no validation of the scalability and usability of the scheme in real industrial scenarios.
+- Inadequate performance analysis. The manuscript only reports the analysis time of BASICS, with no performance benchmarking against baseline tools. There is no in-depth root cause analysis of the state space explosion problem, nor any optimization scheme proposed.
+
+### 4. Inadequate Analysis of Technical Limitations and Robustness
+The manuscript severely lacks analysis of the limitations, robustness, and adversarial resilience of the proposed scheme, with overstated claims of applicability.
+- Overstated scope of application. The current scheme only supports x86-64 Linux binaries, while CPS scenarios widely use embedded architectures such as ARM and MIPS, and the manuscript does not discuss cross-architecture adaptability at all. The patch templates only cover 3 functions (strcpy, sprintf, gets), and the scanf patch is not yet implemented, yet the abstract and conclusion claim effective BO mitigation, which constitutes exaggerated publicity.
+- Complete absence of adversarial robustness analysis. The manuscript does not discuss whether attackers can construct BO vulnerabilities that bypass BASICS detection (e.g., non-continuous stack overflows, overflows triggered by pointer arithmetic, ROP gadget construction), nor does it validate the detection capability of the scheme for complex overflow scenarios. Adversarial resilience is a core evaluation dimension for security papers in top-tier journals.
+- No validation of compatibility with existing protection mechanisms. Modern operating systems and compilers are widely deployed with BO protection mechanisms such as Stack Canary, ASLR, DEP/NX, and CFI. The manuscript completely fails to discuss the compatibility of BASICS's detection and patching scheme with these mechanisms, nor does it validate the effectiveness of the scheme when these protection mechanisms are enabled.
+
+
+## Minor Issues
+1. Grammatical and typographical errors: The abstract contains a possessive error ("it's BO mitigation capabilities" should be "its BO mitigation capabilities").
+2. Unreasonable content layout: The 7 core LTL security properties and CWE mapping rules, which are the core of the paper, are placed in the Appendix, which is not conducive to reviewers quickly grasping the core technical scheme.
+
+
+## Detailed Revision Requirements
+### Mandatory Major Revisions
+1. Restructure the related work section and novelty justification
+- Systematically review the latest research progress in binary BO detection, model checking for binary security, and binary automated patching, and supplement relevant works from top security venues between 2023 and 2025.
+- Create a comparison table to horizontally compare the core characteristics of this work with representative prior works, and clearly articulate the marginal contributions of this work.
+- Rigorously demonstrate the theoretical innovations and targeted advantages of the MemStaCe memory model and extended LTL property definitions, and clarify the irreplaceability of this scheme compared to existing works.
+
+2. Improve the formal theoretical system and supplement core proofs
+- Supplement the strict formal semantics of the MemStaCe transition relation T, and improve the pre/post conditions and state transition rules for memory/byte transition operators.
+- Supplement the standard formal semantic definition of extended LTL operators, correct syntax errors in LTL formulas throughout the text, and unify formula numbering and citations.
+- Supplement the proof of soundness and completeness of the scheme, and clarify the scope of application and completeness limitations of bounded model checking.
+- Supplement the modeling scheme and experimental verification for user-defined functions, nested calls, and recursive scenarios, and improve the technical details and limitation description of loop processing.
+
+3. Restructure the experimental design and supplement sufficient validation and comparison
+- Correct the unfair comparison on the Juliet dataset: supplement the running results of CWE Checker on the same 3010 instances for peer-to-peer comparison; analyze the characteristics and root causes of the timeout instances, and provide optimization schemes or clear limitations.
+- Supplement benchmark experiments with at least 3 mainstream binary vulnerability detection tools, and conduct quantitative comparisons on the same dataset to fully prove the superiority of the scheme.
+- Improve patch effectiveness validation: supplement functional equivalence tests of the program before and after patching, clarify the dual criteria for successful patching (vulnerability remediation + functional preservation), and conduct in-depth analysis of the behavior change problem of sprintf patches and provide solutions.
+- Conduct categorical statistics and root cause analysis of false positive/false negative cases, and provide improvement plans for each type of problem.
+- Supplement testing on at least 3 medium-to-large open-source programs in real CPS scenarios to verify the usability of the scheme in industrial scenarios; supplement performance benchmarking experiments with baseline tools, analyze the root causes of state space explosion, and provide optimization schemes.
+
+4. Improve the analysis of limitations and robustness
+- Clearly state the currently supported architectures and function scope of the scheme to avoid exaggerated publicity; supplement the technical scheme for cross-architecture adaptation, or clearly state it in the limitations.
+- Supplement adversarial analysis, verify the detection capability of the scheme for complex BO overflow scenarios, and discuss the possibility of detection evasion and countermeasures.
+- Supplement compatibility analysis and validation experiments with existing operating system/compiler protection mechanisms.
+
+### Minor Revisions
+1. Correct grammatical errors and abbreviation specifications throughout the text to ensure that all abbreviations are fully defined on first mention.
+2. Move the core LTL security properties and CWE mapping rules from the Appendix to Section 5 of the main text to optimize the paper structure.
+

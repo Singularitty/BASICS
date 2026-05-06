@@ -360,7 +360,7 @@ class ModelChecker:
         for property_key in self.security_properties.keys():
             self.evaluator.set_state_pointer(state)
             result = self.__update_buchi_state(trace, property_key, state)
-            current_stack_frame = self.address_map[trace.trace[-1][0].insn.address] # determine which stack frame the current instruction belongs to
+            current_stack_frame = self.address_map.get(trace.trace[-1][0].insn.address, "unknown") # determine which stack frame the current instruction belongs to
             if result is not None and not result:
                 violation_trace = trace.copy()
                 if property_key in self.violations:

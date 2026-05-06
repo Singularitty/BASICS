@@ -1,0 +1,33 @@
+------ Model Checking Report ------
+
+File: unsafe_memmove_argv
+
+Verified Security Properties:
+  - canary_integrity
+  - no_buffer_overflow__by_one_loop
+  - no_suspect_overflows
+  - no_off_by_one_overflow
+  - no_underflow_clib
+  - no_gets_usage
+  - no_buffer_overflow__by_one_clib
+  - rbp_integrity
+  - no_underflow_loops
+
+Found security property violations:
+
+Property: rip_integrity
+
+Counterexample Trace:
+None                 0x401146:	push	rbp
+push                 0x401146:	push	rbp
+sub                  0x40114a:	sub	rsp, 0x30
+mov                  0x40114e:	mov	dword ptr [rbp - 0x24], edi
+mov                  0x401151:	mov	qword ptr [rbp - 0x30], rsi
+mov                  0x401163:	mov	qword ptr [rbp - 8], rax
+mov                  0x401195:	mov	qword ptr [rbp - 0x10], 0x20
+lea                  0x4011a5:	lea	rax, [rbp - 0x18]
+call memmove         0x4011af:	call	0x401040
+
+1 security property violations found.
+
+Execution Time: 0.18036552700141328 seconds

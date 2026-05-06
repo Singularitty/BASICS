@@ -28,6 +28,11 @@ with open(DIRECTORY + "/src/vulnerabilities.json", 'r', encoding="utf-8") as dat
     VULNERABILITY_INFO = json.load(data)
     
 ANGR_OPTION = None
+FUNCTION_SIMULATION = "auto"
+CONCOLIC_STEP_LIMIT = 10000
+CONCOLIC_ACTIVE_LIMIT = 64
+LTL_BACKEND = "auto"
+ANALYSIS_START_ADDR = None
     
 # Functions that should not be emulated as they don't contribute to the space state
 NO_EXECUTE_FUNCTIONS = [

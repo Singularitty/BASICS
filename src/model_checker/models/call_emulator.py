@@ -51,6 +51,7 @@ class CType(NamedTuple):
 
 # Compost C types
 CHAR_BUFF = CType(DataType.POINTER, 8, CType(DataType.CHAR, 1))
+SIZE_ARG = CType(DataType.SIZE_T, 8)
 
 # Floats not important for now
 
@@ -59,8 +60,10 @@ C_LIB_FUNCTION_DATA = {
     "strcpy": {"safe": False, "arguments": [CHAR_BUFF, CHAR_BUFF]},
     "gets": {"safe": False, "arguments": [CHAR_BUFF]},
     "sprintf": {"safe": False, "arguments": [CHAR_BUFF, CHAR_BUFF]}, 
-    "scanf": {"safe": False, "arguments": [CHAR_BUFF]},
-    "strcat": {"safe": False, "arguments": [CHAR_BUFF, CHAR_BUFF]}
+    "scanf": {"safe": False, "arguments": [CHAR_BUFF, CHAR_BUFF]},
+    "strcat": {"safe": False, "arguments": [CHAR_BUFF, CHAR_BUFF]},
+    "memcpy": {"safe": False, "arguments": [CHAR_BUFF, CHAR_BUFF, SIZE_ARG]},
+    "memmove": {"safe": False, "arguments": [CHAR_BUFF, CHAR_BUFF, SIZE_ARG]},
 }
 
 PARAMETER_REGISTERS = {0: "rdi", 1: "rsi",
@@ -191,8 +194,8 @@ class CallEmulator:
 
         if concolic_exection:
             if self.setup():
-                print(f"Function {self.function_name} detected.\nPerforming Concolic Execution...")
-                self.stack_changes = self.concolic_execution()
+                print(f"Function {self.function_name} detected.\nModeling stack effects...")
+                self.stack_changes = self.__model_stack_effects()
             else:
                 self.stack_changes = []
         else:
@@ -266,7 +269,13 @@ class CallEmulator:
                                                     entry_addr=entry_addr,
                                                     target_addr=target_addr)
                 case _:
-                    raise NotImplementedError(f"Function {self.function_name} not implemented.")
+                    emulated_call = simulator.CLibGeneric(self.expected_parameters.values(),
+                                                    project=self.project,
+                                                    buffer_map=self.buffer_map,
+                                                    stack_size=self.stack_frame.get_stack_size(),
+                                                    entry_addr=entry_addr,
+                                                    target_addr=target_addr,
+                                                    fname=self.function_name)
         try:
             stack_changes = emulated_call.run()
             if self.function_name in global_vars.STDIN_FUNCTIONS:
@@ -275,6 +284,94 @@ class CallEmulator:
             print("Failed to execute function. Skipping...")
             stack_changes = []
         return stack_changes
+
+    def __model_stack_effects(self):
+        if global_vars.FUNCTION_SIMULATION in ("auto", "static"):
+            stack_changes = self.__static_stack_effects()
+            if stack_changes is not None:
+                print(f"Using static stack-effect model for {self.function_name}.")
+                if self.function_name in global_vars.STDIN_FUNCTIONS:
+                    self.save_concolic_input(self.function_name, "A" * max(1, min(self.stack_frame.get_stack_size(), 4096)))
+                return stack_changes
+            if global_vars.FUNCTION_SIMULATION == "static":
+                print(f"Could not statically model {self.function_name}; skipping angr fallback.")
+                return []
+        return self.concolic_execution()
+
+    def __static_stack_effects(self):
+        destination_register = {
+            "strcpy": "rdi",
+            "gets": "rdi",
+            "scanf": "rsi",
+            "strcat": "rdi",
+            "sprintf": "rdi",
+            "memcpy": "rdi",
+            "memmove": "rdi",
+        }.get(self.function_name)
+        if destination_register is None or destination_register not in self.buffer_map:
+            return None
+
+        destination_offset, destination_size = self.buffer_map[destination_register]
+        if destination_size is None:
+            return None
+
+        write_size = self.__static_write_size(destination_size)
+        if write_size <= 0:
+            return []
+
+        return self.__stack_indices_for_write(destination_offset, write_size)
+
+    def __static_write_size(self, destination_size):
+        stack_size = self.stack_frame.get_stack_size()
+        if self.function_name == "strcat":
+            source_size = self.__buffer_size_for_register("rsi")
+            if source_size is None:
+                source_size = stack_size
+            return min(stack_size, destination_size + source_size)
+        if self.function_name == "strcpy":
+            source_size = self.__buffer_size_for_register("rsi")
+            if source_size is not None:
+                return min(stack_size, source_size)
+            return stack_size
+        if self.function_name == "sprintf":
+            source_size = self.__buffer_size_for_register("rdx")
+            if source_size is not None:
+                return min(stack_size, source_size)
+            return stack_size
+        if self.function_name in ("gets", "scanf"):
+            return stack_size
+        if self.function_name in ("memcpy", "memmove"):
+            length = self.__integer_argument_for_register("rdx")
+            if length is None:
+                return stack_size
+            return min(stack_size, max(0, int(length)))
+        return None
+
+    def __buffer_size_for_register(self, register_name):
+        try:
+            return self.buffer_map[register_name][1]
+        except KeyError:
+            return None
+
+    def __integer_argument_for_register(self, register_name):
+        try:
+            arg = self.expected_parameters[register_name]
+        except KeyError:
+            return None
+        if arg is None:
+            return None
+        if isinstance(arg.value, int):
+            return arg.value
+        return None
+
+    def __stack_indices_for_write(self, destination_offset, write_size):
+        high_index = self.stack_frame.get_rbp() + abs(destination_offset) - 1
+        low_index = max(-1, high_index - write_size)
+        return [
+            index
+            for index in range(high_index, low_index, -1)
+            if 0 <= index < self.stack_frame.get_stack_size()
+        ]
                 
                 
     def setup(self):

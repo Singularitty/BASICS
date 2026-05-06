@@ -1,0 +1,19 @@
+------ Model Checking Report ------
+
+File: loop_overflow
+
+Verified Security Properties:
+  - canary_integrity
+  - no_buffer_overflow__by_one_loop
+  - no_suspect_overflows
+  - no_off_by_one_overflow
+  - no_underflow_clib
+  - no_gets_usage
+  - no_buffer_overflow__by_one_clib
+  - rbp_integrity
+  - no_underflow_loops
+  - rip_integrity
+
+No security property violations found.
+
+Execution Time: 3.226842467000097 seconds
