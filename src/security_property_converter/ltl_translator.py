@@ -5,6 +5,7 @@ import subprocess
 import lark
 import pickle
 import rustworkx as rx
+import shutil
 
 from lark import Transformer
 from abc import ABC
@@ -199,11 +200,39 @@ class LinearTemporalLogicTranslator:
     def ltl2ba(self):
         buchi_dir = os.path.join(self.directory, "buchi_automata")
         os.makedirs(buchi_dir, exist_ok=True)
+        if global_vars.LTL_BACKEND in ("spot", "auto"):
+            try:
+                self.__compile_with_spot(buchi_dir)
+                return
+            except ImportError as e:
+                print("Spot Python bindings not found. Trying Spot CLI (ltl2tgba).")
+                try:
+                    self.__compile_with_spot_cli(buchi_dir)
+                    return
+                except Exception:
+                    if global_vars.LTL_BACKEND == "spot":
+                        raise RuntimeError("Spot backend requested, but neither Python spot bindings nor Spot CLI are available.") from e
+                    print("Spot CLI backend not available. Falling back to ltl2ba.")
+            except Exception as e:
+                if global_vars.LTL_BACKEND == "spot":
+                    raise
+                print(f"Spot backend failed: {e}. Trying Spot CLI (ltl2tgba).")
+                try:
+                    self.__compile_with_spot_cli(buchi_dir)
+                    return
+                except Exception:
+                    if global_vars.LTL_BACKEND == "spot":
+                        raise
+                    print("Spot CLI backend failed. Falling back to ltl2ba.")
+
+        if shutil.which("ltl2ba") is None:
+            raise RuntimeError("ltl2ba backend requested, but 'ltl2ba' was not found in PATH.")
+
         for key, formula in self.parsed_formulas.items():
             if key not in self.compiled_formulas:
                 # Execute ltl2ba command and capture its output
                 result = subprocess.run(
-                    ['ltl2ba', '-f', f'"{formula}"'],
+                    ['ltl2ba', '-f', formula],
                     capture_output=True,
                     text=True
                 )
@@ -215,8 +244,62 @@ class LinearTemporalLogicTranslator:
                 else:
                     print(f"Error processing formula {key}: {result.stderr}")
                     self.never_claims[key] = f"Error: {result.stderr}"
+
+    def __compile_with_spot(self, buchi_dir):
+        import spot
+
+        for key, formula in self.parsed_formulas.items():
+            if key in self.compiled_formulas:
+                continue
+            spot_formula = spot.formula(self.__normalize_formula_for_spot(formula))
+            spot_automaton = spot.translate(spot_formula, "BA", "state-based")
+            automata = self.__create_automata_from_spot(spot_automaton, key)
+            self.automata[key] = automata
+            self.save_automata(key, automata)
+            graphviz_draw(
+                automata,
+                node_attr_fn=self.__node_attr_fn,
+                edge_attr_fn=self.__edge_attr_fn,
+                image_type="pdf",
+                filename=os.path.join(buchi_dir, f"{key}.pdf"),
+            )
+            with open(os.path.join(buchi_dir, f"{key}.hoa"), "w", encoding="utf-8") as f:
+                try:
+                    f.write(spot_automaton.to_str("hoa"))
+                except TypeError:
+                    f.write(str(spot_automaton))
+
+    def __compile_with_spot_cli(self, buchi_dir):
+        if shutil.which("ltl2tgba") is None:
+            raise RuntimeError("Spot CLI 'ltl2tgba' not found in PATH.")
+
+        for key, formula in self.parsed_formulas.items():
+            if key in self.compiled_formulas:
+                continue
+            spot_formula = self.__normalize_formula_for_spot(formula)
+            result = subprocess.run(
+                ['ltl2tgba', '--spin', '-f', spot_formula],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Spot CLI failed for {key}: {result.stderr}")
+            self.never_claims[key] = result.stdout
+            with open(os.path.join(buchi_dir, f"{key}.pml"), 'w', encoding='utf-8') as f:
+                f.write(result.stdout)
+
+    def __normalize_formula_for_spot(self, formula: str) -> str:
+        normalized = formula
+        normalized = re.sub(r"\bNOT\s*\(", "!(" , normalized)
+        normalized = re.sub(r"\bNOT\s+([A-Za-z_][A-Za-z0-9_]*)", r"!\1", normalized)
+        normalized = re.sub(r"\bNOT([A-Za-z_][A-Za-z0-9_]*)", r"!\1", normalized)
+        normalized = re.sub(r"\bAND\b", "&&", normalized)
+        normalized = re.sub(r"\bOR\b", "||", normalized)
+        return normalized
                 
     def convert_never_claims_to_automata(self):
+        for key, automata in self.compiled_formulas.items():
+            self.automata[key] = automata
         for key, never_claim in self.never_claims.items():
             if key not in self.compiled_formulas:
                 if 'Error' in never_claim:
@@ -274,6 +357,55 @@ class LinearTemporalLogicTranslator:
                 automata.add_edge(index, target, LogicalCondition(condition_ast, condition))
 
         return automata
+
+    def __create_automata_from_spot(self, spot_automaton, key: str):
+        automata = rx.PyDiGraph(multigraph=False)  # pylint: disable=no-member
+        state_indices = {}
+
+        initial_state = spot_automaton.get_init_state_number()
+        ordered_states = [initial_state] + [
+            state for state in range(spot_automaton.num_states())
+            if state != initial_state
+        ]
+
+        for state in ordered_states:
+            state_indices[state] = automata.add_node({
+                "name": f"s{state}",
+                "is_accepting": self.__spot_state_is_accepting(spot_automaton, state),
+            })
+
+        for source in range(spot_automaton.num_states()):
+            for edge in spot_automaton.out(source):
+                condition = self.__spot_condition_to_basics(spot_automaton, edge.cond)
+                condition = self.__replace_propositions(condition, key)
+                tree = self.propositions_parser.parse(condition)
+                condition_ast = LogicTransformer().transform(tree)
+                automata.add_edge(
+                    state_indices[source],
+                    state_indices[edge.dst],
+                    LogicalCondition(condition_ast, condition),
+                )
+
+        return automata
+
+    def __spot_condition_to_basics(self, spot_automaton, condition):
+        import spot
+
+        condition_string = spot.bdd_format_formula(spot_automaton.get_dict(), condition)
+        condition_string = condition_string.strip()
+        if condition_string == "1":
+            return "True"
+        if condition_string == "0":
+            return "False"
+        condition_string = condition_string.replace("&", "&&")
+        condition_string = condition_string.replace("|", "||")
+        return condition_string
+
+    def __spot_state_is_accepting(self, spot_automaton, state):
+        try:
+            return bool(spot_automaton.state_is_accepting(state))
+        except AttributeError:
+            return False
     
     def __replace_propositions(self, formula: str, key: str):
         for prop, new_prop in self.proposition_map[key].items():

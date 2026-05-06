@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from pwn import cyclic
 
 from src.model_checker.models.wrappers import MemoryAddress
+from src.model_checker.models.concolic_executor import ConcolicExecutor
 from src.exceptions import FailedConcolicExecution
 from src.global_vars import GLOBAL_HOOKS, ANGR_OPTION
 
@@ -65,6 +66,34 @@ class EmulatedFunction(ABC):
     @abstractmethod
     def execute(self):
         ...
+
+    def execute_call_site(self, pre_call_hook=None, steps=3):
+        pre_call_state = ConcolicExecutor.reaching_state(self.project, self.target_node.addr)
+        pre_call_state = ConcolicExecutor.advance_instructions(
+            self.project,
+            pre_call_state,
+            self.__instruction_index_in_block(),
+        )
+        self.stack_pointer = pre_call_state.regs.rsp
+
+        if pre_call_hook is not None:
+            pre_call_hook(pre_call_state)
+
+        self.stack_before = pre_call_state.solver.eval(
+            pre_call_state.memory.load(self.stack_pointer, self.stack_size),
+            cast_to=bytes,
+        )
+        post_call_state = ConcolicExecutor.step_from_state(self.project, pre_call_state, steps=steps)
+        self.stack_after = post_call_state.solver.eval(
+            post_call_state.memory.load(self.stack_pointer, self.stack_size),
+            cast_to=bytes,
+        )
+
+    def __instruction_index_in_block(self):
+        for index, instruction in enumerate(self.target_node.block.capstone.insns):
+            if instruction.address == self.target_addr:
+                return index
+        return 0
     
     def convert_indice(self, indice, stack_size):
         """Converts the index given by the emulator to the index of the stack array.
@@ -114,21 +143,6 @@ class Strcpy(EmulatedFunction):
         self.stack_pointer = None
     
     def execute(self):
-        main_addr = self.project.loader.main_object.get_symbol("main")
-        if ANGR_OPTION is None:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, mode=ANGR_OPTION, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-        else:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, add_options={
-                                                                                                        angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                        angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                        })
-
         self.source_on_stack = False
         for arg, details in self.buffer_map.items():
             #print(arg)
@@ -138,51 +152,16 @@ class Strcpy(EmulatedFunction):
                     break
                 break
 
-
-        simgr = self.project.factory.simgr(self.entry_state)
-        simgr.explore(find=self.target_addr)
-        
-        #print(source)
-        #print(destination)
-        #else:
-        #    self.entry_state = self.project.factory.entry_state(addr=self.entry_addr, add_options={angr.options.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY, angr.options.CONSTRAINT_TRACKING_IN_SOLVER})
-        #print(hex(self.target_addr))
-        #print(hex(self.entry_addr))
-        if simgr.found:
-            pre_call_state = simgr.found[0]
-            self.stack_pointer = pre_call_state.regs.rsp
+        def pre_call_hook(pre_call_state):
             if not self.source_on_stack:
                 print("Source buffer is not on current stack frame")
                 stdin = cyclic(self.stack_size)
                 cyclic_input = claripy.BVV(stdin)
-                buffer_adrr = self.entry_state.regs.rbp + 0x8 * 2 # just toss the argument on the stack, this is bull
-                self.entry_state = self.project.factory.entry_state(addr=self.entry_addr, add_options={angr.options.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY, angr.options.CONSTRAINT_TRACKING_IN_SOLVER})
-                pre_call_state.memory.store(buffer_adrr, cyclic_input)
-                pre_call_state.regs.rsi = buffer_adrr
-            
-            # Fill stack with null bytes
-            #if self.source_on_stack:
-            #    pre_call_state.memory.store(self.stack_pointer, b'\x00' * self.stack_size)
-            #    pre_call_state.memory.store(self.source_addr, self.source_buffer)
-            
-            # Save the stack before the call
-            self.stack_before = pre_call_state.solver.eval(pre_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-            
-            for _ in range(3):
-                simgr.step(stash="found")
-            post_call_state = simgr.found[0]
-            
-            # Save the stack after the call
-            self.stack_after = post_call_state.solver.eval(post_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-            
-            #print(self.stack_before)
-            #print(self.stack_after)
-            del self.entry_state
-            del simgr
-        else:
-            del self.entry_state
-            del simgr
-            raise FailedConcolicExecution
+                buffer_addr = pre_call_state.regs.rbp + 0x8 * 2
+                pre_call_state.memory.store(buffer_addr, cyclic_input)
+                pre_call_state.regs.rsi = buffer_addr
+
+        self.execute_call_site(pre_call_hook)
             
             
             
@@ -195,50 +174,11 @@ class Gets(EmulatedFunction):
         self.stack_pointer = None
     
     def execute(self):
-        
-        main_addr = self.project.loader.main_object.get_symbol("main")
-        if ANGR_OPTION is not None:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, mode=ANGR_OPTION, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-        else:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-        self.entry_state.libc.buf_symbolic_bytes = 0x1000
-        self.entry_state.libc.maximum_buffer_size = 0x1000
-        simgr = self.project.factory.simgr(self.entry_state)
-        simgr.explore(find=self.target_addr)
-        
-        if simgr.found:
-            pre_call_state = simgr.found[0]
-            self.stack_pointer = pre_call_state.regs.rsp
-            # Save the stack before the call
-            self.stack_before = pre_call_state.solver.eval(pre_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-            
-            for _ in range(3):
-                simgr.step(stash="found")
-            post_call_state = simgr.found[0]
-            
-            # Save the stack after the call
-            self.stack_after = post_call_state.solver.eval(post_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-            
-            #print(self.stack_before)
-            #print(self.stack_after)
-            del self.entry_state
-            del simgr
-        else:
-            del self.entry_state
-            del simgr
-            raise FailedConcolicExecution
+        def pre_call_hook(pre_call_state):
+            pre_call_state.libc.buf_symbolic_bytes = 0x1000
+            pre_call_state.libc.maximum_buffer_size = 0x1000
+
+        self.execute_call_site(pre_call_hook)
             
 class Scanf(EmulatedFunction):
     
@@ -249,48 +189,7 @@ class Scanf(EmulatedFunction):
         self.stack_pointer = None
     
     def execute(self):
-        main_addr = self.project.loader.main_object.get_symbol("main")
-        if ANGR_OPTION is not None:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, mode=ANGR_OPTION, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-        else:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-        #self.entry_state.libc.maximum_buffer_size = 0x1000
-        #self.entry_state.libc.
-
-        simgr = self.project.factory.simgr(self.entry_state)
-        
-        simgr.explore(find=self.target_addr)
-        
-        if simgr.found:
-            pre_call_state = simgr.found[0]
-            self.stack_pointer = pre_call_state.regs.rsp
-            # Save the stack before the call
-            self.stack_before = pre_call_state.solver.eval(pre_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-            
-            for _ in range(3):
-                simgr.step(stash="found")
-            post_call_state = simgr.found[0]
-            
-            # Save the stack after the call
-            self.stack_after = post_call_state.solver.eval(post_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-            del self.entry_state
-            del simgr
-        else:
-            del self.entry_state
-            del simgr
-            raise FailedConcolicExecution
+        self.execute_call_site()
             
 class Strcat(EmulatedFunction):
 
@@ -301,45 +200,7 @@ class Strcat(EmulatedFunction):
         self.stack_pointer = None
 
     def execute(self):
-        main_addr = self.project.loader.main_object.get_symbol("main")
-        if ANGR_OPTION is not None:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, mode=ANGR_OPTION, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-        else:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-
-        simgr = self.project.factory.simgr(self.entry_state)
-        simgr.explore(find=self.target_addr)
-
-        if simgr.found:
-            pre_call_state = simgr.found[0]
-            self.stack_pointer = pre_call_state.regs.rsp
-            # Save the stack before the call
-            self.stack_before = pre_call_state.solver.eval(pre_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-
-            for _ in range(3):
-                simgr.step(stash="found")
-            post_call_state = simgr.found[0]
-
-            # Save the stack after the call
-            self.stack_after = post_call_state.solver.eval(post_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-            del self.entry_state
-            del simgr
-        else:
-            del self.entry_state
-            del simgr
-            raise FailedConcolicExecution
+        self.execute_call_site()
 
 
 class Sprintf(EmulatedFunction):
@@ -352,24 +213,6 @@ class Sprintf(EmulatedFunction):
         self.source_on_stack = True
 
     def execute(self):
-        main_addr = self.project.loader.main_object.get_symbol("main")
-        if ANGR_OPTION is not None:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, mode=ANGR_OPTION, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-        else:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-
         found_source = False
         for arg, details in self.buffer_map.items():
             if arg == "rdx":
@@ -379,37 +222,16 @@ class Sprintf(EmulatedFunction):
                     break
                 break
 
-        simgr = self.project.factory.simgr(self.entry_state)
-        simgr.explore(find=self.target_addr)
-
-        if simgr.found:
-            pre_call_state = simgr.found[0]
-            self.stack_pointer = pre_call_state.regs.rsp
+        def pre_call_hook(pre_call_state):
             if not found_source or not self.source_on_stack:
                 print("Source buffer is not on current stack frame")
                 stdin = cyclic(self.stack_size)
                 cyclic_input = claripy.BVV(stdin)
-                buffer_adrr = self.entry_state.regs.rbp + 0x8 * 2 
-                self.entry_state = self.project.factory.entry_state(addr=self.entry_addr, add_options={angr.options.CGC_ZERO_FILL_UNCONSTRAINED_MEMORY, angr.options.CONSTRAINT_TRACKING_IN_SOLVER})
-                pre_call_state.memory.store(buffer_adrr, cyclic_input)
-                pre_call_state.regs.rdx = buffer_adrr
-            self.stack_before = pre_call_state.solver.eval(pre_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
+                buffer_addr = pre_call_state.regs.rbp + 0x8 * 2
+                pre_call_state.memory.store(buffer_addr, cyclic_input)
+                pre_call_state.regs.rdx = buffer_addr
 
-            for _ in range(3):
-                simgr.step(stash="found")
-            post_call_state = simgr.found[0]
-
-            # Save the stack after the call
-            self.stack_after = post_call_state.solver.eval(post_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-
-            #print(self.stack_before)
-            #print(self.stack_after)
-            del self.entry_state
-            del simgr
-        else:
-            del self.entry_state
-            del simgr
-            raise FailedConcolicExecution
+        self.execute_call_site(pre_call_hook)
 
 class CLibGeneric(EmulatedFunction):
     
@@ -420,49 +242,4 @@ class CLibGeneric(EmulatedFunction):
         self.stack_pointer = None
 
     def execute(self):
-        main_addr = self.project.loader.main_object.get_symbol("main")
-        if ANGR_OPTION is not None:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, mode=ANGR_OPTION, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-        else:
-            self.entry_state = self.project.factory.blank_state(addr=main_addr.rebased_addr, add_options={angr.options.CONCRETIZE_SYMBOLIC_WRITE_SIZES,
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY, 
-                                                                                                      angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-                                                                                                      angr.options.REPLACEMENT_SOLVER,
-                                                                                                      angr.options.UNICORN,
-                                                                                                      angr.options.UNICORN_THRESHOLD_CONCRETIZATION,
-                                                                                                      })
-
-        simgr = self.project.factory.simgr(self.entry_state)
-        simgr.explore(find=self.target_addr)
-
-        if simgr.found:
-            pre_call_state = simgr.found[0]
-            self.stack_pointer = pre_call_state.regs.rsp
-            # Save the stack before the call
-            self.stack_before = pre_call_state.solver.eval(pre_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-
-            for _ in range(3):
-                try:
-                    simgr.step(stash="found")
-                    post_call_state = simgr.found[0]
-                except IndexError:
-                    try:
-                        post_call_state = simgr.unconstrained[0]
-                    except IndexError:
-                        raise FailedConcolicExecution
-                    
-
-            # Save the stack after the call
-            self.stack_after = post_call_state.solver.eval(post_call_state.memory.load(self.stack_pointer, self.stack_size), cast_to=bytes)
-            del self.entry_state
-            del simgr
-        else:
-            del self.entry_state
-            del simgr
-            raise FailedConcolicExecution
+        self.execute_call_site()

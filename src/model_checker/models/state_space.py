@@ -13,13 +13,36 @@ class StateSpace:
         self.current_directory = current_directory
         self.binary_name = binary_name 
         self.state_space_images = None
+        self._state_index_by_key = {}
+
+    def _state_key(self, memory_state: MemoryState):
+        frames = []
+        for name, frame in sorted(memory_state.stack_frames_map.items()):
+            frames.append((
+                name,
+                frame.stack_frame.tobytes(),
+                tuple(sorted(frame.buffer_map.items())),
+                frame.rbp,
+                frame.canary,
+                frame.canary_written,
+            ))
+        instruction_addr = None
+        if memory_state.instruction is not None:
+            instruction_addr = memory_state.instruction.address
+        return tuple(frames), instruction_addr
         
     def add_state(self, memory_state: MemoryState):
         """
         Adds a memory state to the state space.
         """
+        state_key = self._state_key(memory_state)
+        if state_key in self._state_index_by_key:
+            memory_state.index = self._state_index_by_key[state_key]
+            return self.graph[memory_state.index]
         index = self.graph.add_node(memory_state)
         self.graph[index].index = index
+        self._state_index_by_key[state_key] = index
+        return self.graph[index]
         
     def add_transition(self, source_state: MemoryState, target_state: MemoryState, transition):
         """

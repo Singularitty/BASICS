@@ -1,0 +1,32 @@
+------ Model Checking Report ------
+
+File: unsafe_sprintf
+
+Verified Security Properties:
+  - canary_integrity
+  - no_buffer_overflow__by_one_loop
+  - no_suspect_overflows
+  - no_off_by_one_overflow
+  - no_underflow_clib
+  - no_gets_usage
+  - no_buffer_overflow__by_one_clib
+  - rbp_integrity
+  - no_underflow_loops
+
+Found security property violations:
+
+Property: rip_integrity
+
+Counterexample Trace:
+None                 0x401136:	push	rbp
+push                 0x401136:	push	rbp
+sub                  0x40113a:	sub	rsp, 0x20
+mov                  0x40113e:	mov	dword ptr [rbp - 0x14], edi
+mov                  0x401141:	mov	qword ptr [rbp - 0x20], rsi
+mov                  0x401160:	mov	qword ptr [rbp - 8], rax
+lea                  0x40116f:	lea	rax, [rbp - 0x10]
+call sprintf         0x40117e:	call	0x401040
+
+1 security property violations found.
+
+Execution Time: 0.13472119300058694 seconds
