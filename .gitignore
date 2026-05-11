@@ -1,3 +1,22 @@
+# Large/generated benchmark inputs and outputs.
+Benchmarks/
+
+# BASICS generated reports and ad-hoc benchmark outputs. Tracked files remain
+# tracked, but new generated reports should not pollute git status.
+reports/
+*_scan_report.txt
+basics_*.csv
+*_juliet*.csv
+file.txt
+
+# Local tool installs/checkouts.
+.tools/
+
+# Local agent/editor state.
+.codex/
+.claude/
+.python-version
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

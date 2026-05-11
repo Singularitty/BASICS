@@ -1756,5 +1756,29 @@
         "System Include File": "math.h",
         "Function Prototype": "double yn(int n, double x);",
         "Description": "Calculates the Bessel function value of the second kind of order n."
+    },
+    {
+        "Function": "fgets",
+        "System Include File": "stdio.h",
+        "Function Prototype": "char *fgets(char *s, int size, FILE *stream);",
+        "Description": "Reads at most size-1 characters from a stream into a buffer."
+    },
+    {
+        "Function": "read",
+        "System Include File": "unistd.h",
+        "Function Prototype": "ssize_t read(int fd, void *buf, size_t count);",
+        "Description": "Reads up to count bytes from a file descriptor into a buffer."
+    },
+    {
+        "Function": "recv",
+        "System Include File": "sys/socket.h",
+        "Function Prototype": "ssize_t recv(int sockfd, void *buf, size_t len, int flags);",
+        "Description": "Receives up to len bytes from a socket into a buffer."
+    },
+    {
+        "Function": "stpcpy",
+        "System Include File": "string.h",
+        "Function Prototype": "char *stpcpy(char *dest, const char *src);",
+        "Description": "Copies a string to a destination buffer and returns a pointer to the terminator."
     }
 ]

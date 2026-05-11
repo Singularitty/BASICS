@@ -1,0 +1,1 @@
+[]!($exists_stack s: exists_buffer s, b: modified_after_buffer(s, buffer(s, b), 8)$)

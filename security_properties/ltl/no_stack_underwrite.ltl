@@ -1,0 +1,1 @@
+[]!($exists_stack s: exists_buffer s, b: (buffer_size(buffer(s, b)) > 31 && byte(s, start(buffer(s, b)) + 1) = Modified && byte(s, start(buffer(s, b)) + 2) = Occupied)$)

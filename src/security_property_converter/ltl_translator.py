@@ -173,13 +173,24 @@ class LinearTemporalLogicTranslator:
     def find_formulas(self):
         for file in os.listdir(self.directory + "/ltl"):
             if file.endswith(".ltl"):
+                key = file[:-4]
+                if self.__is_experimental_property(key):
+                    continue
                 with open (self.directory + "/ltl/" + file, "r") as f:
-                    self.formulas[file[:-4]] = f.read().strip("\n")
+                    self.formulas[key] = f.read().strip("\n")
         if os.path.isdir(self.directory + "/buchi_automata") and global_vars.RECOMPILE_LTL is False:
             for file in os.listdir(self.directory + "/buchi_automata"):
                 if file.endswith(".pickle"):
                     key = os.path.basename(file).split(".")[0]
+                    if self.__is_experimental_property(key):
+                        continue
                     self.compiled_formulas[key] = self.load_automata(key)
+
+    def __is_experimental_property(self, key):
+        return (
+            key.startswith("experimental_")
+            and not global_vars.INCLUDE_EXPERIMENTAL_PROPERTIES
+        )
     
     def map_propositions(self):
         for key, formula in self.formulas.items():
