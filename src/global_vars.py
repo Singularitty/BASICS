@@ -33,6 +33,9 @@ CONCOLIC_STEP_LIMIT = 10000
 CONCOLIC_ACTIVE_LIMIT = 64
 LTL_BACKEND = "auto"
 ANALYSIS_START_ADDR = None
+SCAN_MEMORY_LIMIT_MB = None  # RSS ceiling per function in scan mode; None = unlimited
+MEMORY_LIMIT_MB = None  # RSS ceiling for normal whole-binary analysis; None = unlimited
+INCLUDE_EXPERIMENTAL_PROPERTIES = False
     
 # Functions that should not be emulated as they don't contribute to the space state
 NO_EXECUTE_FUNCTIONS = [
@@ -40,7 +43,6 @@ NO_EXECUTE_FUNCTIONS = [
     "free",
     "fclose",
     "strlen",
-    "fscanf",
     "fopen",
     "strcmp",
     "malloc",
@@ -68,10 +70,13 @@ NO_EXECUTE_FUNCTIONS = [
 STDIN_FUNCTIONS = [
     'catgets6',
     'fgets1',
+    'fgets',
     'fscanf',
     'fwscanf6',
     'gets',
     'scanf',
+    'read',
+    'recv',
     'sscanf',
     'swscanf',
     'vfscanf',
@@ -86,3 +91,6 @@ STDIN_FUNCTIONS = [
 
 # Hooks
 GLOBAL_HOOKS = set()
+
+# Suppress per-function verbose output during bulk scans
+SCAN_MODE = False

@@ -143,6 +143,18 @@ class WriteOperation(MemoryOperation):
                 "Invalid source type\nSource: " + source)
 
 
+class IndexedWriteOperation(WriteOperation):
+    """
+    Represents a write to an RBP-relative stack address with an index register,
+    e.g. [rbp + rax * 4 - 0x40].
+    """
+
+    def __init__(self, displacement, index_register, scale, source, source_type, instruction: str) -> None:
+        super().__init__(displacement, source, source_type, instruction)
+        self.index_register = index_register
+        self.scale = scale if scale is not None else 1
+
+
 class BufferAllocation(MemoryOperation):
     """
     Represents a buffer allocation operation that was performed on the stack.
@@ -242,6 +254,16 @@ class MemoryTransition:
                                 elif instruction.operands[1].type == X86_OP_IMM:
                                     offset = address.disp
                                     return WriteOperation(offset, address, X86_OP_IMM, instruction.op_str)
+                            elif instruction.reg_name(address.base) == "rbp" and instruction.reg_name(address.index) is not None:
+                                offset = address.disp
+                                index_register = instruction.reg_name(address.index)
+                                scale = address.scale
+                                if instruction.operands[1].type == X86_OP_REG:
+                                    source = instruction.operands[1]
+                                    reg_name = instruction.reg_name(source.reg)
+                                    return IndexedWriteOperation(offset, index_register, scale, reg_name, source.type, instruction.op_str)
+                                elif instruction.operands[1].type == X86_OP_IMM:
+                                    return IndexedWriteOperation(offset, index_register, scale, address, X86_OP_IMM, instruction.op_str)
                             else:
                                 return None
                         # If the second operand is a memory address, a read from memory operation is performed

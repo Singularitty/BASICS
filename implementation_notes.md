@@ -324,3 +324,210 @@ export PATH="$PWD/.tools/bin:$PATH"
 source .venv/bin/activate
 python src/main.py --help
 ```
+
+---
+
+## Second Revision: Static Modeling Accuracy and Patch Coverage
+
+These changes improve the accuracy of the static call emulator and extend patch generation to more vulnerability patterns. The SARD benchmark (151 cases) went from TP=20, TN=97, FP=3, FN=31 (baseline) to TP=41, TN=96, FP=2, FN=9, with 100% of detected true positives both patched and validated via GDB.
+
+### 9. Heap Buffer Size Tracking Through Stack Pointer Variables
+
+The static call emulator (`src/model_checker/models/call_emulator.py`) now tracks the size of heap-allocated buffers through local stack pointer variables. This enables detection of vulnerabilities where `malloc` is followed by a clib write to a different, smaller stack buffer.
+
+**Mechanism.** `__determine_local_pointer_assignments` now maintains two extra maps:
+
+- `local_malloc_size_map`: maps rbp-relative slot offset → known heap buffer size for the pointer stored at that slot.
+- `register_malloc_sizes`: maps register → the heap buffer size it currently holds a pointer to.
+
+When a `call malloc` is seen, the constant in `rdi` (from `__track_alloca_constants`) is recorded as the allocation size in `rax`. When the return value is stored to a stack slot (`mov [rbp-N], rax`), the size is committed to `local_malloc_size_map[N]`. When that slot is later reloaded into a register (`mov reg, [rbp-N]`), the size is reinstated in `register_malloc_sizes[reg]`.
+
+`__buffer_size_for_register` now falls back to `register_malloc_sizes` when a register is not in `buffer_map`, so write-size computation for functions like `strcpy` can use the source buffer's heap size.
+
+**Memset interaction.** When `call memset` is seen, BASICS checks whether `rdi` carries a `register_malloc_source_slots` entry pointing to a stack slot in `local_malloc_size_map`. If so, `local_malloc_size_map[slot]` is updated to the memset byte count. This correctly reflects the effective string length after a memset-then-null-terminate pattern.
+
+**Effect on SARD.** Nine malloc+strcpy cases (sard_0113–0131, odd-numbered) that were previously FN became TP. Cases with a safe memset (49 bytes into a 50-byte dest) remained TN.
+
+### 10. Pointer Tracking Correctness: Non-rbp Load Clearing and Indirect Dereference
+
+The previous implementation of `__determine_local_pointer_assignments` left stale entries in `register_points_to_stack` after non-rbp memory loads (e.g., `mov rax, [rax]`). This created circular entries in `local_pointer_map` for double-pointer patterns like:
+
+```c
+char *data;
+char **dataPtr1 = &data;
+data = malloc(100);
+data = *dataPtr1;      // mov rax, [rbp-8]; mov rax, [rax]  ← stale rax persisted
+mov [rbp-offset], rax  // circular: local_pointer_map[offset] = MemoryAddress(rbp, -offset)
+```
+
+The circular entry made downstream analysis treat the heap pointer as a stack address, causing false positives.
+
+**Fix: clearing on untracked loads.** In the `mov reg, [mem]` handler, when the memory source is neither rbp-relative nor an indirect dereference through a known pointer, all tracking for the destination register is cleared:
+
+```python
+else:
+    register_points_to_stack.pop(dst_reg, None)
+    register_malloc_sizes.pop(dst_reg, None)
+    register_malloc_source_slots.pop(dst_reg, None)
+```
+
+**Fix: indirect dereference tracking.** When the memory source is `[reg]` (simple dereference, no index or displacement) and `reg` is in `register_points_to_stack` pointing to an rbp slot, BASICS now looks up `local_malloc_size_map` for that slot and carries the heap buffer size forward without creating a circular stack pointer:
+
+```python
+elif (
+    isinstance(src_mem, MemoryAddress)
+    and src_mem.index_register is None
+    and src_mem.displacement is None
+    and canonical_register(src_mem.base_register) in register_points_to_stack
+):
+    base = canonical_register(src_mem.base_register)
+    pointed_mem = register_points_to_stack[base]
+    register_points_to_stack.pop(dst_reg, None)   # result is heap, not stack
+    if isinstance(pointed_mem, MemoryAddress) and canonical_register(...) == "rbp":
+        deref_slot = abs(pointed_mem.displacement or 0)
+        if deref_slot in self.local_malloc_size_map:
+            register_malloc_sizes[dst_reg] = self.local_malloc_size_map[deref_slot]
+            register_malloc_source_slots[dst_reg] = deref_slot
+```
+
+**Fix: reg-to-reg clearing.** The `mov dst, src` (reg-to-reg) handler now clears `dst` tracking when `src` is not tracked, rather than silently leaving stale tracking values:
+
+```python
+if src_reg in register_points_to_stack:
+    register_points_to_stack[dst_reg] = register_points_to_stack[src_reg]
+else:
+    register_points_to_stack.pop(dst_reg, None)
+# same for register_malloc_sizes and register_malloc_source_slots
+```
+
+**Effect on SARD.** Three false positives caused by circular pointer confusion (sard_0107, sard_0108, sard_0134) became TN. The double-pointer TP case sard_0133 now correctly identifies `strcpy` as the vulnerable sink instead of `memset`.
+
+### 11. fscanf and sscanf Patch Support
+
+The patcher (`src/vulnerability_identifier_removal/patcher.py`) previously listed `scanf` but not `fscanf` or `sscanf`. Both functions use `rdx` as their first output argument (third parameter), unlike `scanf` which uses `rsi`.
+
+Two entries were added to `PATCH_DETAILS`:
+
+```python
+"fscanf": {"args": ["rdi", "rsi", "rdx"], "patch_file": "fscanf_patch",
+           "no_size": "fscanf_unknown_size_patch", "dest_reg": "rdx"},
+"sscanf": {"args": ["rdi", "rsi", "rdx"], "patch_file": "sscanf_patch",
+           "no_size": "sscanf_unknown_size_patch", "dest_reg": "rdx"},
+```
+
+Four new patch payloads were added and compiled with e9compile under `src/vulnerability_identifier_removal/patches/`:
+
+- `fscanf_patch.c` / `fscanf_unknown_size_patch.c`: replace the `fscanf` call with `fgets(rdx, size, rdi)`, bounding the read to the known or dynamically computed destination buffer size.
+- `sscanf_patch.c` / `sscanf_unknown_size_patch.c`: replace the `sscanf` call with `strncpy(rdx, rdi, size-1)` followed by a null terminator, bounding the copy to the destination buffer size.
+
+The unknown-size variants use the same rbp-based runtime size computation as the existing `gets_unknown_size_patch` and `strcpy_unknown_size_patch`.
+
+**Effect on SARD.** Five fscanf/sscanf cases (sard_0005, 0006, 0007, 0009, 0052) that were detected but unpatched are now patched and GDB-validated.
+
+### 12. Identifier Coverage: no_stack_underwrite and no_buffer_overflow__by_one_clib
+
+The vulnerability identifier (`src/vulnerability_identifier_removal/identifier.py`) previously handled only `rip_integrity`, `rbp_integrity`, `no_suspect_overflows`, `no_suspect_underflows`, `no_off_by_one_underflows_clib`, and `no_gets_usage` as triggers for sink-finding and patch generation. Two additional properties are now included:
+
+- `no_stack_underwrite`: violations of this property occur when a clib function writes below a buffer's allocated stack region. The counterexample trace ends at the responsible `call` instruction (typically `strcpy`). Adding this property to the match case allows BASICS to identify and patch the responsible function.
+- `no_buffer_overflow__by_one_clib`: violations of this property occur when a clib write exceeds the buffer allocated for the destination. Adding it means BASICS can patch cases that violate this specific property without also violating `rip_integrity` (e.g., when the stack frame is large enough that the overflow does not reach the saved return address).
+
+The match statement in `Identifier.find_vulnerability` was extended:
+
+```python
+case "rip_integrity" | "rbp_integrity" | "no_suspect_overflows" | ... \
+     | "no_stack_underwrite" | "no_buffer_overflow__by_one_clib":
+```
+
+**Effect on SARD.** Six previously unpatched TPs (sard_0133, 0135, 0140, 0142, 0144, 0146) now produce patches and pass GDB validation. For underwrite cases, the patcher uses the unknown-size variant because the write destination is typically a pointer arithmetic result rather than a directly stack-allocated buffer.
+
+### Updated Benchmark Results (SARD, 151 cases)
+
+| Metric | Baseline | After revision 1 (paper) | After revision 2 |
+|---|---|---|---|
+| TP | 20 | 36 | 41 |
+| TN | 97 | 95 | 96 |
+| FP | 3 | 3 | 2 |
+| FN | 31 | 17 | 9 |
+| Precision | 0.87 | 0.92 | 0.95 |
+| Recall | 0.39 | 0.68 | 0.82 |
+| F1 | 0.54 | 0.78 | 0.88 |
+| TPs patched | — | — | 41/41 (100%) |
+| Patches validated | — | — | 41/41 (100%) |
+
+Remaining FPs (sard_0047, sard_0051) are pre-existing cases involving safe sprintf and sscanf patterns that require format-string width analysis beyond the current static model. Remaining FNs involve indirect pointer chains with more than two levels of indirection, loop-based writes, or multi-destination scanf calls not yet handled by the argument recovery logic.
+
+### 13. Structured Bounded Patch Validation
+
+The old patch validator effectively treated "patched binary did not crash" as
+the main success criterion. It has been replaced with a structured bounded
+validator that writes `reports/<binary>/patch_validation.json` and separates:
+
+- malicious-input remediation evidence;
+- benign/boundary regression evidence;
+- GDB patch-site observations;
+- failures;
+- inconclusive cases.
+
+The validator supports generated fallback inputs and optional JSON input files
+via `--validation-inputs`. It records SHA-256 hashes and previews for inputs
+and process outputs, not full large payloads. CLI controls were added for
+`--validation-timeout`, `--no-gdb-validation`, `--no-regression-validation`,
+and `--strict-stderr-validation`.
+
+Important framing: the validator explicitly records
+`full_functional_equivalence: false`. The supported claim is bounded automated
+patch validation over generated or provided inputs.
+
+### SARD Result With Structured Validation and Patch-Payload Fixes
+
+Command:
+
+```bash
+scripts/run_compiled_stack_benchmarks.sh sard --patching --timeout 180 \
+  --validation-timeout 10 --cfg-mode fast --simulation static \
+  --no-gdb-validation
+```
+
+Results were written to:
+
+```text
+Benchmarks/stack_benchmark/results/20260511T194553.822566Z/results.csv
+Benchmarks/stack_benchmark/results/20260511T194553.822566Z/results.json
+```
+
+Aggregate detection over 151 SARD cases:
+
+- TP=38, TN=94, FP=6, FN=13
+- accuracy=87.4%, precision=86.4%, recall=74.5%, specificity=94.0%
+- F1=0.8000, MCC=0.7130
+
+Patching/validation:
+
+- patched=46
+- validation not run=105
+- fully passed bounded validation=10
+- remediation passed with preservation inconclusive=13
+- inconclusive=23
+- bounded validation failed=0
+
+The patch-payload pass fixed the failures surfaced by the first structured
+validation run:
+
+- E9Patch clean-ABI payloads now preserve return values through `&rax`.
+- `gets` replacement strips newlines to match the removed libc call.
+- `scanf`/`fscanf`/`sscanf` replacements handle simple `%s` and integer
+  conversions, including field widths.
+- `sprintf` replacement forces a terminating NUL after bounded formatting.
+- malloc-backed destinations are skipped instead of being patched with
+  stack-relative unknown-size payloads.
+- input-patching for `scanf`/`gets` is capped when a later same-function stack
+  copy would copy the input into a smaller adjacent destination.
+- generated regression inputs avoid treating nondeterministic original behavior
+  or unsafe original crashes as functional-preservation failures.
+
+The no-GDB aggregate has no bounded-validation failures. Inconclusive cases are
+still reported explicitly and should not be described as full validation
+passes.
+
+See `docs/sard_patch_validation_experiment.md` for the detailed SARD
+experiment note.

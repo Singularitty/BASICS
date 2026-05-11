@@ -1,7 +1,19 @@
 import angr
+import os
 
 from src import global_vars
 from src.exceptions import FailedConcolicExecution
+
+_PAGESIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+
+def _rss_mb():
+    """Return current RSS in MB by reading /proc/self/statm (Linux only, cheap)."""
+    try:
+        with open("/proc/self/statm") as f:
+            rss_pages = int(f.read().split()[1])
+        return rss_pages * _PAGESIZE / (1024 * 1024)
+    except Exception:
+        return 0.0
 
 
 class ConcolicExecutor:
@@ -42,23 +54,39 @@ class ConcolicExecutor:
         return project.factory.blank_state(**kwargs)
 
     @classmethod
-    def reaching_state(cls, project, target_addr, start_addr=None):
+    def reaching_state(cls, project, target_addr, start_addr=None, step_limit=None):
         if start_addr is None:
             start_addr = cls.entry_address(project)
         cache_key = (id(project), start_addr, target_addr)
         if cache_key in cls._state_cache:
             return cls._state_cache[cache_key].copy()
 
+        if step_limit is None:
+            step_limit = global_vars.CONCOLIC_STEP_LIMIT
+
         entry_state = cls.blank_entry_state(project, start_addr)
         simgr = project.factory.simgr(entry_state)
 
-        for _ in range(global_vars.CONCOLIC_STEP_LIMIT):
+        mem_limit = global_vars.SCAN_MEMORY_LIMIT_MB
+        for step in range(step_limit):
             found = cls._find_target_state(simgr, target_addr)
             if found is not None:
                 cls._state_cache[cache_key] = found.copy()
                 return found.copy()
             if not simgr.active:
                 break
+            # Drop states with symbolic PC — they come from unresolved indirect
+            # calls/jumps (function pointers) and will never reach a concrete target.
+            simgr.active = [s for s in simgr.active if s.ip.concrete]
+            if not simgr.active:
+                break
+            # Check RSS every 50 steps to avoid OOM on large binaries.
+            if mem_limit is not None and step % 50 == 0:
+                rss = _rss_mb()
+                if rss > mem_limit:
+                    raise FailedConcolicExecution(
+                        f"Memory limit {mem_limit:.0f} MB exceeded ({rss:.0f} MB RSS)"
+                    )
             simgr.active = sorted(simgr.active, key=lambda state: abs(state.addr - target_addr))
             simgr.active = simgr.active[:global_vars.CONCOLIC_ACTIVE_LIMIT]
             simgr.step()

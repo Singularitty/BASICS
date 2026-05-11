@@ -119,4 +119,9 @@ if ! command -v e9tool >/dev/null 2>&1; then
     fi
 fi
 
+PYVEX_LIB="$VENV_DIR/lib/python3.11/site-packages/pyvex/lib"
+if [ -d "$PYVEX_LIB" ]; then
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$PYVEX_LIB"
+fi
+
 exec python "$ROOT_DIR/src/main.py" --ltl-backend "$LTL_BACKEND_RUNTIME" "${EXTRA_ARGS[@]}" "$@"

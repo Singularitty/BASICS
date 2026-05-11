@@ -8,11 +8,15 @@
         "vulnerability" : ["CWE-121"]
     },
     {
-        "property" : "no_off_by_one_underflows_loops",
+        "property" : "no_underflow_loops",
         "vulnerability" : ["CWE-124"]
     },
     {
-        "property" : "no_off_by_one_underflows_clib",
+        "property" : "no_underflow_clib",
+        "vulnerability" : ["CWE-124"]
+    },
+    {
+        "property" : "no_stack_underwrite",
         "vulnerability" : ["CWE-124"]
     },
     {

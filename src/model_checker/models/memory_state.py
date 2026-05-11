@@ -14,7 +14,7 @@ ByteStateRepresentation = {
 class MemoryState:
     """
     A memory state is the basic block for the stack memory space.
-    
+
     It is a collection of stack frames, each representing the memory state of a function.
     It also contains a transition, which is the memory operator that led to the current state.
     """
@@ -46,7 +46,7 @@ class MemoryState:
         Returns the stack frame of the given function name.
         """
         return self.stack_frames_map[function_name]
-    
+
     def get_stack_frame(self, function_name):
         """
         Returns a copy of the stack frame of the given function name.
@@ -60,10 +60,10 @@ class MemoryState:
             return deepcopy(new_frame)
         except Exception as e:
             raise NonExistentStackFrame(f"Error {e} for stack frame {function_name}")
-    
+
     def get_stack_frames(self):
         return self.stack_frames_map.values()
-    
+
     def get_stack_frame_names(self):
         return self.stack_frames_map.keys()
 
@@ -72,7 +72,14 @@ class MemoryState:
         Returns true if the memory state contains a stack frame for the given function name.
         """
         return function_name in self.stack_frames_map
-    
+
+    def recursion_depth(self, function_name):
+        """
+        Returns how many times function_name already appears in the call stack.
+        Because stack_frames_map stores one frame per function, this is 0 or 1.
+        """
+        return 1 if function_name in self.stack_frames_map else 0
+
     def draw(self):
         """
         Create an ASCII representation of multiple stacks with titles.
@@ -90,7 +97,7 @@ class MemoryState:
 
             # For debugging
             # print(stack_frame.buffer_map)
-            
+
             # Add each element of the stack
             for index, byte in enumerate(stack):
                 ascii_representation += f"{index}: {ByteStateRepresentation[byte]}"
@@ -111,4 +118,4 @@ class MemoryState:
             ascii_representation += ""
 
         return ascii_representation[:-1]
-    
+

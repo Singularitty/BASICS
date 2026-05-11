@@ -1,0 +1,1 @@
+[]!($exists_stack s: critical_range_modified(s, 0, 15)$)

@@ -30,10 +30,17 @@ class Evaluator:
             "byte": self.byte,
             "previous_transition": self.previous_transition,
             "buffer": self.buffer,
+            "buffer_size": self.buffer_size,
             "get_buffer_map": self.get_buffer_map,
             "start": self.start,
             "end": self.end,
-            "has_canary": self.has_canary
+            "has_canary": self.has_canary,
+            "range_has_state": self.range_has_state,
+            "range_all_state": self.range_all_state,
+            "modified_after_buffer": self.modified_after_buffer,
+            "modified_before_buffer": self.modified_before_buffer,
+            "critical_range_modified": self.critical_range_modified,
+            "modified_run_length": self.modified_run_length,
         }
 
     def log(self, msg: str):
@@ -151,7 +158,13 @@ class Evaluator:
                             r = self.eval(expression, {**context, variable: stack, "stack_frame": stack})
                             results.append(r)
                     self.log(f"EXISTS_STACK results: {results}")
-                    return None if not results or any(r is None for r in results) else any(results)
+                    if not results:
+                        return None
+                    if any(r is True for r in results):
+                        return True
+                    if any(r is None for r in results):
+                        return None
+                    return False
 
             elif "FORALL_BUFFER" in ast:
                 stack_var = ast["FORALL_BUFFER"]["stack"]
@@ -182,7 +195,13 @@ class Evaluator:
                         r = self.eval(expression, {**context, buffer_var: buffer_id})
                         results.append(r)
                     self.log(f"EXISTS_BUFFER results: {results}")
-                    return None if not results or any(r is None for r in results) else any(results)
+                    if not results:
+                        return None
+                    if any(r is True for r in results):
+                        return True
+                    if any(r is None for r in results):
+                        return None
+                    return False
         return None
 
     # Functions used inside evaluation
@@ -223,6 +242,11 @@ class Evaluator:
         self.log(f"buffer({stack_frame}, {buffer_id}) = {result}")
         return result
 
+    def buffer_size(self, buffer) -> int:
+        result = buffer[0]
+        self.log(f"buffer_size({buffer}) = {result}")
+        return result
+
     def start(self, buffer) -> int:
         result = abs(buffer[1]) + 15
         self.log(f"start({buffer}) = {result}")
@@ -246,6 +270,95 @@ class Evaluator:
         result = False if s.canary_written is None else s.canary_written
         self.log(f"has_canary({stack_frame}) = {result}")
         return result
+
+    def range_has_state(self, stack_frame, start: int, end: int, state: int) -> bool:
+        stack_frame = self.__coerce_stack_frame(stack_frame)
+        start, end = self.__normalize_range(start, end)
+        for index in range(start, end + 1):
+            if index >= stack_frame.get_stack_size():
+                break
+            if stack_frame.get_byte_state(index) == state:
+                return True
+        return False
+
+    def range_all_state(self, stack_frame, start: int, end: int, state: int) -> bool:
+        stack_frame = self.__coerce_stack_frame(stack_frame)
+        start, end = self.__normalize_range(start, end)
+        if start >= stack_frame.get_stack_size():
+            return False
+        for index in range(start, min(end, stack_frame.get_stack_size() - 1) + 1):
+            if stack_frame.get_byte_state(index) != state:
+                return False
+        return True
+
+    def modified_after_buffer(self, stack_frame, buffer, count: int) -> bool:
+        stack_frame = self.__coerce_stack_frame(stack_frame)
+        if count <= 0:
+            return False
+        first_index_after_buffer = self.end(buffer) - 1
+        return self.range_has_state(
+            stack_frame,
+            first_index_after_buffer - count + 1,
+            first_index_after_buffer,
+            self.__state_value("Modified"),
+        )
+
+    def modified_before_buffer(self, stack_frame, buffer, count: int) -> bool:
+        stack_frame = self.__coerce_stack_frame(stack_frame)
+        if count <= 0:
+            return False
+        first_index_before_buffer = self.start(buffer) + 1
+        return self.range_has_state(
+            stack_frame,
+            first_index_before_buffer,
+            first_index_before_buffer + count - 1,
+            self.__state_value("Modified"),
+        )
+
+    def critical_range_modified(self, stack_frame, start: int, end: int) -> bool:
+        stack_frame = self.__coerce_stack_frame(stack_frame)
+        return self.range_has_state(
+            stack_frame,
+            start,
+            end,
+            self.__state_value("Modified"),
+        )
+
+    def modified_run_length(self, stack_frame, minimum_length: int) -> bool:
+        stack_frame = self.__coerce_stack_frame(stack_frame)
+        if minimum_length <= 0:
+            return False
+        current_run = 0
+        modified = self.__state_value("Modified")
+        for index in range(stack_frame.get_stack_size()):
+            if stack_frame.get_byte_state(index) == modified:
+                current_run += 1
+                if current_run >= minimum_length:
+                    return True
+            else:
+                current_run = 0
+        return False
+
+    def __coerce_stack_frame(self, stack_frame) -> StackFrame:
+        if isinstance(stack_frame, StackFrame):
+            return stack_frame
+        if isinstance(stack_frame, str):
+            return self.memory_state.get_stack_frame(stack_frame)
+        raise InvalidLTLFormulaException("Invalid stack frame")
+
+    def __normalize_range(self, start: int, end: int):
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise InvalidLTLFormulaException("Invalid byte range")
+        start = max(0, start)
+        end = max(0, end)
+        if start > end:
+            start, end = end, start
+        return start, end
+
+    def __state_value(self, state):
+        if isinstance(state, str):
+            return {"Free": 0, "Critical": 1, "Occupied": 2, "Modified": 3}[state]
+        return state
 
 
 class ExecutionTrace:
@@ -406,7 +519,6 @@ class ModelChecker:
             condition = transition[2].ast
             context = {**self.default_context, "property_key": property_key}
             result = self.evaluator.eval(condition, context)
-            #print(property_key, result, '\n', condition)
             if result:  # Check for None before evaluating to True
                 trace.transition_buchi_state(property_key, transition[1])
                 return True

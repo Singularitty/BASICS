@@ -33,7 +33,7 @@ class StackFrame:
         self.canary_written = canary_written
 
     def __copy__(self) -> "StackFrame":
-        return StackFrame(self.stack_frame.copy(), self.buffer_map.copy(), self.rbp)
+        return StackFrame(self.stack_frame.copy(), self.buffer_map.copy(), self.rbp, self.canary, self.canary_written)
 
     def initialize(self):
         """
@@ -88,7 +88,7 @@ class StackFrame:
             new_stack_frame[offset], WriteType.NON_CRITICAL)
         for i in range(data_size):
             new_stack_frame[offset-i] = new_state
-        return StackFrame(new_stack_frame, self.buffer_map.copy(), self.rbp)
+        return StackFrame(new_stack_frame, self.buffer_map.copy(), self.rbp, self.canary, self.canary_written)
 
     def write_multiple_bytes(self, indices):
         new_stack_frame = self.stack_frame.copy()
@@ -106,7 +106,7 @@ class StackFrame:
             [self.stack_frame, np.full(data_size, new_state, dtype=np.uint8)])
         # if a critical push is made, the rbp register is incremented because the stack base pointer of the caller has been saved
         new_rbp = self.rbp + data_size if critical else self.rbp
-        return StackFrame(new_stack_frame, self.buffer_map.copy(), new_rbp)
+        return StackFrame(new_stack_frame, self.buffer_map.copy(), new_rbp, self.canary, self.canary_written)
 
     def pop(self, data_size: int):
         """Pops a byte from the stack frame.
