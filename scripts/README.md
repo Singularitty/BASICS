@@ -12,6 +12,8 @@ benchmark commands refer to these paths directly.
 
 Benchmark compile flags and standard runner settings are documented in
 [`docs/benchmark_flags.md`](../docs/benchmark_flags.md).
+For paper-style reproducibility wrappers and committed OSS/Linux benchmark
+selection manifests, see [`benchmarks/README.md`](../benchmarks/README.md).
 
 ## Stack Datasets
 
