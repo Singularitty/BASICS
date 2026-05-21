@@ -94,3 +94,6 @@ GLOBAL_HOOKS = set()
 
 # Suppress per-function verbose output during bulk scans
 SCAN_MODE = False
+SCAN_EXCLUDE_RUNTIME_SYMBOLS = True
+SCAN_CONSTRAIN_ARG_REGS = False
+SCAN_ARG_STACK_GUARD_BYTES = 0x200000

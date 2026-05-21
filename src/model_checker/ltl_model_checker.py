@@ -559,9 +559,8 @@ class ModelChecker:
         neighbors = list(self.state_space.graph.neighbors(current_state_index))
 
         if not neighbors:
-            accepting, key = self.__is_accepting_state(trace)
             self.final_traces.append(trace.copy())
-            if not accepting:
+            for key in self.__non_accepting_properties(trace):
                 violation_trace = trace.copy()
                 violation_trace.add_transition(current_state.instruction, current_state, transition_operator)
                 if key in self.violations:
@@ -575,14 +574,17 @@ class ModelChecker:
                 self.__dfs_traversal(neighbor, visited, new_trace, current_state_index)
 
 
-    def __is_accepting_state(self, trace: ExecutionTrace):
+    def __non_accepting_properties(self, trace: ExecutionTrace):
         """
-        Checks if the end of the trace is at an accepting state for all properties.
+        Return properties whose Buchi automata ended in a non-accepting state.
         """
+        non_accepting = []
         for property_key in self.security_properties.keys():
             buchi_automaton = self.security_properties[property_key]
-            buchi_state = trace.buchi_states[property_key]
-            return (buchi_automaton[buchi_state]["is_accepting"], property_key)
+            buchi_state = trace.buchi_states.get(property_key, 0)
+            if not buchi_automaton[buchi_state]["is_accepting"]:
+                non_accepting.append(property_key)
+        return non_accepting
 
     def __find_source_state(self):
         """

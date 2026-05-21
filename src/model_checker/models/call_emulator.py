@@ -382,6 +382,9 @@ class CallEmulator:
         if destination_register is None:
             return None
         if destination_register not in self.buffer_map:
+            rsp_alloca_indices = self.__rsp_alloca_overflow_indices_for_register(destination_register)
+            if rsp_alloca_indices is not None:
+                return rsp_alloca_indices
             underwrite_indices = self.__stack_underwrite_indices_for_register(destination_register)
             if underwrite_indices is not None:
                 return underwrite_indices
@@ -403,9 +406,6 @@ class CallEmulator:
                         f"write_size={write_size} dest_size={dynamic_size}; no stack overflow modeled."
                     )
                 return []
-            rsp_alloca_indices = self.__rsp_alloca_overflow_indices_for_register(destination_register)
-            if rsp_alloca_indices is not None:
-                return rsp_alloca_indices
             return None
 
         destination_offset, destination_size = self.buffer_map[destination_register]
@@ -487,20 +487,25 @@ class CallEmulator:
         return self.function_name in (
             "strcpy", "stpcpy", "strncpy", "strcat", "strncat",
             "sprintf", "snprintf", "vsprintf", "vsnprintf", "memcpy", "memmove", "memset",
-            "read", "recv",
+            "read", "recv", "gets", "scanf", "fscanf", "sscanf",
         )
 
     def __rsp_alloca_overflow_indices_for_register(self, register_name):
         arg = self.expected_parameters.get(register_name)
         if arg is None or self.rsp_allocation_size is None:
             return None
-        if self.function_name not in ("memcpy", "memmove", "memset"):
-            return None
         if arg.value != "rsp":
             return None
         write_size = self.__static_write_size(self.rsp_allocation_size)
         if write_size is None:
             return None
+        if self.function_name in ("gets", "scanf", "fscanf", "sscanf", "sprintf", "vsprintf"):
+            if global_vars.DEBUG:
+                print(
+                    f"Static call effect: {self.function_name} has unbounded rsp-backed "
+                    f"destination allocation={self.rsp_allocation_size}; using full-frame write."
+                )
+            return self.__full_stack_write()
         if write_size > self.rsp_allocation_size and self.__known_local_overflow(self.rsp_allocation_size, write_size):
             if global_vars.DEBUG:
                 print(
@@ -961,6 +966,16 @@ class CallEmulator:
                                 src_state.instruction,
                             )
                             return
+                        if src_name == "rsp" and self.rsp_allocation_size is not None:
+                            self.register_values[reg_name] = RegisterState(
+                                reg_name,
+                                OperandType.REGISTER,
+                                "rsp",
+                                reg_name in self.expected_parameters,
+                                ins.address,
+                                ins,
+                            )
+                            return
                     if is_memory(op2):
                         mem = get_operand_value(ins, op2)
                         if isinstance(mem, MemoryAddress) and canonical_register(mem.base_register) == "rbp":
@@ -1169,10 +1184,14 @@ class CallEmulator:
                         src_reg = get_register_name(ins, ins.operands[1])
                         if src_reg in register_points_to_stack:
                             register_points_to_stack[dst_reg] = register_points_to_stack[src_reg]
+                        elif src_reg == "rsp" and self.rsp_allocation_size is not None:
+                            register_points_to_stack[dst_reg] = "rsp"
                         else:
                             register_points_to_stack.pop(dst_reg, None)
                         if src_reg in register_malloc_sizes:
                             register_malloc_sizes[dst_reg] = register_malloc_sizes[src_reg]
+                        elif src_reg == "rsp" and self.rsp_allocation_size is not None:
+                            register_malloc_sizes[dst_reg] = self.rsp_allocation_size
                         else:
                             register_malloc_sizes.pop(dst_reg, None)
                         if src_reg in register_malloc_source_slots:
@@ -1290,10 +1309,14 @@ class CallEmulator:
         if not is_register(dst):
             return
         dst_reg = get_register_name(ins, dst)
-        if ins.mnemonic == "sub" and dst_reg == "rsp" and is_register(src):
-            size = register_constants.get(get_register_name(ins, src))
+        if ins.mnemonic == "sub" and dst_reg == "rsp":
+            size = None
+            if is_register(src):
+                size = register_constants.get(get_register_name(ins, src))
+            elif is_immediate(src):
+                size = int(src.imm)
             if size is not None and size > 0:
-                self.rsp_allocation_size = size
+                self.rsp_allocation_size = (self.rsp_allocation_size or 0) + int(size)
             return
         match ins.mnemonic:
             case "mov" | "movsxd":
