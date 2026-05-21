@@ -51,9 +51,10 @@ class StackFrame:
     def write_canary(self):
         if self.canary_written:
             return self
-        if (self.rbp + 8) > len(self.stack_frame):
-            new_stack_frame = np.concatenate([new_stack_frame, np.full(
-                (self.rbp + 8) - len(self.stack_frame), ByteState.FREE, dtype=np.uint8)])
+        required_size = 24
+        if required_size > len(self.stack_frame):
+            new_stack_frame = np.concatenate([self.stack_frame, np.full(
+                required_size - len(self.stack_frame), ByteState.FREE, dtype=np.uint8)])
         else:
             new_stack_frame = self.stack_frame.copy()
         for i in range(8):

@@ -59,6 +59,7 @@ def main():
     parser.add_argument("tool", choices=sorted(TOOLS))
     parser.add_argument("dataset", choices=sorted(DATASETS))
     parser.add_argument("timeout", type=int, help="Per-case timeout in seconds.")
+    parser.add_argument("--workers", type=int, default=1, help="Parallel case workers for external-tool runs.")
     parser.add_argument("--limit", type=int, default=None, help="Optional quick-test case limit.")
     parser.add_argument("--case-id", action="append", default=[], help="Optional substring filter; repeatable.")
     parser.add_argument("--prepare", action="store_true", help="Run the standard preparation step first.")
@@ -84,6 +85,8 @@ def main():
         "--timeout-sec",
         str(args.timeout),
     ]
+    if args.workers != 1:
+        cmd.extend(["--workers", str(args.workers)])
     if spec["dataset"]:
         cmd.extend(["--dataset", spec["dataset"]])
     if args.limit is not None:

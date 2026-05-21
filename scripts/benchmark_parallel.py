@@ -145,6 +145,8 @@ def benchmark_command(args, tool: str, dataset: str) -> list[str]:
             tool,
             dataset,
             str(args.timeout),
+            "--workers",
+            str(args.case_workers),
             "--no-metrics",
         ]
     if args.limit is not None:
@@ -229,6 +231,7 @@ def main():
         ),
     )
     parser.add_argument("--jobs", type=int, default=2, help="Number of benchmarks to run concurrently.")
+    parser.add_argument("--case-workers", type=int, default=1, help="Parallel cases per external-tool benchmark job.")
     parser.add_argument("--timeout", type=int, default=300, help="Per-case timeout in seconds.")
     parser.add_argument("--limit", type=int, default=None, help="Optional quick-test case limit passed to each benchmark.")
     parser.add_argument("--case-id", action="append", default=[], help="Optional substring filter passed to each benchmark; repeatable.")
@@ -246,6 +249,8 @@ def main():
         parser.error("provide at least one TOOL:DATASET job, or use --tool/--dataset")
     if args.jobs < 1:
         parser.error("--jobs must be at least 1")
+    if args.case_workers < 1:
+        parser.error("--case-workers must be at least 1")
 
     total = len(jobs)
     workers = min(args.jobs, total)

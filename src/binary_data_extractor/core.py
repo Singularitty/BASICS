@@ -31,6 +31,7 @@ class BinaryDataExtractor:
         cfg_fast_normalize=True,
         cfg_fast_function_starts_only=False,
         cfg_extra_starts=None,
+        find_loops=True,
     ) -> None:
 
         # Create Angr Project
@@ -65,7 +66,7 @@ class BinaryDataExtractor:
             cfg_extra_starts=cfg_extra_starts,
         )
         self.functions = self.extract_user_functions()
-        self.loops = self.find_loops()
+        self.loops = self.find_loops() if find_loops else []
 
         self.address_to_function = {}
         self.map_addresses_to_functions()
