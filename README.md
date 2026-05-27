@@ -10,14 +10,45 @@ is mostly Python, with small C patch stubs under
 Use Python 3.11. The pinned angr version in `requirements.txt` is not meant for
 newer Python releases.
 
-On a fresh Ubuntu-like machine, install the system pieces first:
+Choose one setup path.
+
+### Arch Linux
+
+On Arch, use the installer:
+
+```bash
+./install_arch.sh
+```
+
+The script uses `pacman`, sets up Python 3.11 through `pyenv` when needed,
+installs Spot when available, builds E9Patch under `.tools/e9patch`, creates
+`.venv`, installs the Python requirements, and compiles the patch stubs.
+
+After it finishes, either use the wrapper:
+
+```bash
+./run_basics.sh --help
+```
+
+or activate the environment directly:
+
+```bash
+export PATH="$PWD/.tools/bin:$PATH"
+source .venv/bin/activate
+python src/main.py --help
+```
+
+### Debian/Ubuntu or Manual Setup
+
+There is no Debian/Ubuntu installer in this repo. Install the basic system
+packages yourself:
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y graphviz gcc gdb git make patchelf python3.11 python3.11-venv
 ```
 
-Then let the wrapper create the local environment:
+Then let the wrapper create the local Python environment:
 
 ```bash
 PYTHON_BIN=python3.11 ./run_basics.sh --help
@@ -26,10 +57,10 @@ PYTHON_BIN=python3.11 ./run_basics.sh --help
 `run_basics.sh` creates `.venv`, installs `requirements.txt`, adds `.tools/bin`
 to `PATH`, and then forwards the remaining arguments to `src/main.py`.
 
-For patching runs, put `e9tool` on `PATH`. Without it, the wrapper falls back
-to analysis-only mode. For LTL translation, install Spot or `ltl2ba`; if neither
-is available, BASICS reuses the checked-in automata cache. On Arch Linux,
-`./install_arch.sh` installs the usual toolchain and builds E9Patch locally.
+For patching runs, install E9Patch separately and put `e9tool` on `PATH`.
+Without it, the wrapper falls back to analysis-only mode. For LTL translation,
+install Spot or `ltl2ba`; if neither is available, BASICS reuses the checked-in
+automata cache.
 
 ## Run BASICS
 
