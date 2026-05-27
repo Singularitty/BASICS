@@ -1,0 +1,66 @@
+{
+  "description": "Open-source C/C++ projects used for BASICS real-binary sweeps. The setup script clones these repositories at depth 1 and records generated binary manifests under Benchmarks/opensource.",
+  "output_manifest": "Benchmarks/opensource/opensource_cases.json",
+  "function_manifest": "Benchmarks/opensource/opensource_function_cases_repro.json",
+  "max_binaries_per_project": 25,
+  "reported_completion_threshold": 0.7,
+  "projects": [
+    {
+      "name": "soem",
+      "repo": "https://github.com/OpenEtherCATsociety/SOEM.git",
+      "domain": "industrial-control"
+    },
+    {
+      "name": "canopennode",
+      "repo": "https://github.com/CANopenNode/CANopenNode.git",
+      "domain": "industrial-control"
+    },
+    {
+      "name": "open62541",
+      "repo": "https://github.com/open62541/open62541.git",
+      "domain": "industrial-control"
+    },
+    {
+      "name": "libplctag",
+      "repo": "https://github.com/libplctag/libplctag.git",
+      "domain": "industrial-control"
+    },
+    {
+      "name": "lib60870",
+      "repo": "https://github.com/mz-automation/lib60870.git",
+      "domain": "industrial-control"
+    },
+    {
+      "name": "libiec61850",
+      "repo": "https://github.com/mz-automation/libiec61850.git",
+      "domain": "industrial-control"
+    },
+    {
+      "name": "libuv",
+      "repo": "https://github.com/libuv/libuv.git",
+      "domain": "systems"
+    },
+    {
+      "name": "libyaml",
+      "repo": "https://github.com/yaml/libyaml.git",
+      "domain": "parser"
+    },
+    {
+      "name": "cjson",
+      "repo": "https://github.com/DaveGamble/cJSON.git",
+      "domain": "parser"
+    }
+  ],
+  "function_sweep": {
+    "include_main": true,
+    "all_symbols": true,
+    "workers": 8,
+    "timeout_sec": 240,
+    "memory_limit_mb": 2500,
+    "hard_memory_limit_mb": null,
+    "concolic_step_limit": 100,
+    "concolic_active_limit": 16,
+    "max_states": 5000,
+    "cfg_skip_loopfinder": false
+  }
+}

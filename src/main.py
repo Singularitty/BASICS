@@ -76,6 +76,56 @@ def get_arguments():
              "Builds the CFG once and iterates. Implies --large-binary-mode and --no-patching.",
     )
     parser.add_argument(
+        "--scan-include-runtime-symbols",
+        action="store_true",
+        help="Include ELF/compiler/runtime helper symbols such as _init and frame_dummy in --scan-all-functions.",
+    )
+    parser.add_argument(
+        "--scan-constrain-arg-regs",
+        action="store_true",
+        help="In --scan-all-functions, constrain ABI argument registers away from the current stack window.",
+    )
+    parser.add_argument(
+        "--scan-suppress-rbp-only",
+        action="store_true",
+        help="In --scan-all-functions, classify rbp_integrity-only findings as low-confidence instead of vulnerable.",
+    )
+    parser.add_argument(
+        "--scan-arg-stack-guard-bytes",
+        type=lambda value: int(value, 0),
+        default=0x200000,
+        help="Stack exclusion window for --scan-constrain-arg-regs. Accepts decimal or 0x-prefixed values.",
+    )
+    parser.add_argument(
+        "--scan-confirm-callers",
+        action="store_true",
+        help="In --scan-all-functions, confirm vulnerable candidates by re-running from direct caller functions.",
+    )
+    parser.add_argument(
+        "--scan-confirm-max-callers",
+        type=int,
+        default=4,
+        help="Maximum direct callers to try for each candidate when --scan-confirm-callers is enabled.",
+    )
+    parser.add_argument(
+        "--scan-confirm-max-states",
+        type=int,
+        default=None,
+        help="Optional state cap for caller-context confirmation runs. Defaults to --max-states.",
+    )
+    parser.add_argument(
+        "--scan-skip-loopfinder",
+        action="store_true",
+        help="Skip angr LoopFinder in scan mode. Faster/lower-memory, but loop-based findings may be missed.",
+    )
+    parser.add_argument(
+        "--hard-memory-limit-mb",
+        type=int,
+        default=None,
+        metavar="MB",
+        help="Set a hard process address-space limit. Useful for scan workers so the OS kills one case instead of the host.",
+    )
+    parser.add_argument(
         "--cfg-fast-complete-scan",
         action="store_true",
         help="Enable CFGFast complete scan (slower, broader coverage).",
@@ -94,6 +144,11 @@ def get_arguments():
         "--cfg-fast-function-starts-only",
         action="store_true",
         help="Seed CFGFast only from the selected analysis entry.",
+    )
+    parser.add_argument(
+        "--cfg-skip-loopfinder",
+        action="store_true",
+        help="Skip angr LoopFinder. Reduces memory on large binaries at the cost of loop emulation coverage.",
     )
     parser.add_argument(
         "--patch-aware",
@@ -436,6 +491,29 @@ def _load_exec_segments(binary_path):
     return int(project.entry), segments
 
 
+def _apply_hard_memory_limit(limit_mb):
+    if limit_mb is None:
+        return
+    if limit_mb <= 0:
+        return
+    try:
+        import resource
+    except ImportError:
+        print("WARNING: --hard-memory-limit-mb is not supported on this platform.")
+        return
+    limit_bytes = int(limit_mb) * 1024 * 1024
+    try:
+        current_soft, current_hard = resource.getrlimit(resource.RLIMIT_AS)
+        hard = current_hard
+        if hard == resource.RLIM_INFINITY or limit_bytes <= hard:
+            resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, hard))
+        else:
+            resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+        print(f"Hard memory limit: {limit_mb} MB address space")
+    except (OSError, ValueError) as exc:
+        print(f"WARNING: failed to set hard memory limit: {exc}")
+
+
 def _changed_file_regions(original_path, patched_path, max_regions=128):
     with open(original_path, "rb") as f:
         original = f.read()
@@ -526,6 +604,7 @@ def inspect_existing_patch(original_path, patched_path, args):
         cfg_fast_normalize=not args.cfg_fast_no_normalize,
         cfg_fast_function_starts_only=args.cfg_fast_function_starts_only,
         cfg_extra_starts=None,
+        find_loops=not args.cfg_skip_loopfinder,
     )
     patched_data = BinaryDataExtractor(
         patched_path,
@@ -537,6 +616,7 @@ def inspect_existing_patch(original_path, patched_path, args):
         cfg_fast_normalize=not args.cfg_fast_no_normalize,
         cfg_fast_function_starts_only=args.cfg_fast_function_starts_only,
         cfg_extra_starts=patched_starts,
+        find_loops=not args.cfg_skip_loopfinder,
     )
     emit_binary_load_summary(original_data, "original")
     emit_binary_load_summary(patched_data, "patched")
@@ -587,6 +667,7 @@ def analyze_binary(
         cfg_fast_normalize=not args.cfg_fast_no_normalize,
         cfg_fast_function_starts_only=args.cfg_fast_function_starts_only,
         cfg_extra_starts=cfg_extra_starts,
+        find_loops=not args.cfg_skip_loopfinder,
     )
     previous_analysis_start = global_vars.ANALYSIS_START_ADDR
     global_vars.ANALYSIS_START_ADDR = binary_data.analysis_entry_addr
@@ -625,6 +706,11 @@ def analyze_binary(
         model_checker.state_space_transversal()
 
         report = model_checker.create_report()
+        try:
+            entry_func = binary_data.cfg.kb.functions.get_by_addr(binary_data.analysis_entry_addr)
+        except Exception:
+            entry_func = None
+        _postprocess_report_violations(report, entry_func, binary_data.cfg)
     finally:
         global_vars.ANALYSIS_START_ADDR = previous_analysis_start
 
@@ -652,6 +738,328 @@ def _has_stack_frame(func, cfg):
     return False
 
 
+def _function_saves_rbp(func, cfg):
+    get_node = cfg.get_any_node if hasattr(cfg, "get_any_node") else cfg.model.get_any_node
+    node = get_node(func.addr)
+    if node is None or node.is_simprocedure or node.block is None:
+        return False
+    try:
+        insns = node.block.capstone.insns[:6]
+    except Exception:
+        return False
+    saw_push_rbp = False
+    for ins in insns:
+        if ins.mnemonic == "push" and ins.op_str == "rbp":
+            saw_push_rbp = True
+        elif saw_push_rbp and ins.mnemonic == "mov" and ins.op_str.replace(" ", "") == "rbp,rsp":
+            return True
+    return False
+
+
+def _suppress_irrelevant_rbp_violation(report, func, cfg):
+    if func is not None and not _function_saves_rbp(func, cfg):
+        report.violations.pop("rbp_integrity", None)
+
+
+GENERIC_UNDERFLOW_PROPERTIES = {
+    "no_underflow_clib",
+    "no_underflow_loops",
+}
+
+
+def _suppress_generic_underflow_noise(report):
+    """Drop broad underflow probes unless the explicit underwrite property fires."""
+    if "no_stack_underwrite" in report.violations:
+        return
+    for prop in GENERIC_UNDERFLOW_PROPERTIES:
+        report.violations.pop(prop, None)
+
+
+def _postprocess_report_violations(report, func, cfg):
+    _suppress_irrelevant_rbp_violation(report, func, cfg)
+    _suppress_generic_underflow_noise(report)
+
+
+RUNTIME_SCAN_SYMBOLS = {
+    "_init",
+    "_fini",
+    "_start",
+    "__libc_start_main",
+    "__libc_csu_init",
+    "__libc_csu_fini",
+    "deregister_tm_clones",
+    "register_tm_clones",
+    "__do_global_dtors_aux",
+    "frame_dummy",
+    "call_gmon_start",
+}
+
+
+def _is_runtime_scan_symbol(name):
+    if not name:
+        return True
+    runtime_prefixes = (
+        "_dl_",
+        "__libc_",
+        "__gmon_",
+        "__cxa_",
+        "__do_global_",
+        "__x86.get_pc_thunk",
+    )
+    runtime_suffixes = (
+        "@plt",
+        ".plt",
+    )
+    return (
+        name in RUNTIME_SCAN_SYMBOLS
+        or name.startswith(runtime_prefixes)
+        or name.endswith(runtime_suffixes)
+    )
+
+
+RUNTIME_SCAN_SECTIONS = {
+    ".init",
+    ".fini",
+    ".plt",
+    ".plt.got",
+    ".plt.sec",
+}
+
+
+def _function_section_name(project, addr):
+    try:
+        section = project.loader.find_section_containing(addr)
+    except Exception:
+        section = None
+    if section is None:
+        return None
+    return getattr(section, "name", None)
+
+
+def _is_runtime_scan_section(project, addr):
+    section_name = _function_section_name(project, addr)
+    return section_name in RUNTIME_SCAN_SECTIONS
+
+
+def _is_scan_candidate(func, binary_data, args):
+    cfg = binary_data.cfg
+    if not _has_stack_frame(func, cfg):
+        return False
+    if not args.scan_include_runtime_symbols and (
+        _is_runtime_scan_symbol(func.name)
+        or _is_runtime_scan_section(binary_data.project, func.addr)
+    ):
+        return False
+    return True
+
+
+def _direct_call_target(ins):
+    if ins.mnemonic != "call" or not ins.operands:
+        return None
+    try:
+        return int(ins.operands[0].imm)
+    except Exception:
+        return None
+
+
+def _find_direct_callers(binary_data, target_func, max_callers):
+    callers = []
+    seen = set()
+    for caller in binary_data.functions:
+        if caller.addr == target_func.addr:
+            continue
+        try:
+            block_addrs = sorted(caller.block_addrs)
+        except Exception:
+            continue
+        for block_addr in block_addrs:
+            try:
+                block = binary_data.project.factory.block(block_addr)
+            except Exception:
+                continue
+            for ins in block.capstone.insns:
+                if _direct_call_target(ins) != target_func.addr:
+                    continue
+                key = (caller.addr, ins.address)
+                if key in seen:
+                    continue
+                seen.add(key)
+                callers.append((caller, ins.address))
+    callers.sort(key=lambda item: (item[0].name or "", item[1]))
+    if max_callers is not None and max_callers >= 0:
+        callers = callers[:max_callers]
+    return callers
+
+
+def _function_instruction_addrs(func):
+    addrs = set()
+    try:
+        blocks = func.blocks
+    except Exception:
+        return addrs
+    for block in blocks:
+        try:
+            addrs.update(block.instruction_addrs)
+        except Exception:
+            continue
+    return addrs
+
+
+def _report_mentions_function(report, function_name, function_instruction_addrs, properties=None):
+    allowed = set(properties) if properties is not None else None
+    for prop, violations in report.violations.items():
+        if allowed is not None and prop not in allowed:
+            continue
+        for violation in violations:
+            trace = getattr(violation.counter_example_trace, "trace", [])
+            for instruction, memory_state, _ in trace:
+                try:
+                    if function_name in memory_state.get_stack_frame_names():
+                        return True
+                except Exception:
+                    pass
+                if instruction is not None and getattr(instruction, "address", None) in function_instruction_addrs:
+                    return True
+    return False
+
+
+def _run_scan_entry(
+    binary_data,
+    entry_func,
+    security_properties,
+    args,
+    current_dir,
+    binary_name,
+    binary_path,
+    max_states=None,
+):
+    import gc
+
+    previous_addr = binary_data.analysis_entry_addr
+    previous_entry = binary_data.analysis_entry
+    previous_global_addr = global_vars.ANALYSIS_START_ADDR
+    try:
+        ConcolicExecutor._state_cache.clear()
+        gc.collect()
+        binary_data.analysis_entry_addr = entry_func.addr
+        binary_data.analysis_entry = entry_func.name
+        global_vars.ANALYSIS_START_ADDR = entry_func.addr
+        constructor = StateSpaceConstructor(
+            binary_data,
+            binary_name,
+            current_dir,
+            binary_path,
+            args.max_iterations,
+            max_states if max_states is not None else args.max_states,
+            args.max_recursion_depth,
+        )
+        constructor.construct_state_space()
+
+        model_checker = ModelChecker(
+            binary_name,
+            constructor.state_space,
+            security_properties,
+            binary_data.address_to_function,
+        )
+        model_checker.state_space_transversal()
+        report = model_checker.create_report()
+        _postprocess_report_violations(report, entry_func, binary_data.cfg)
+        return report
+    finally:
+        binary_data.analysis_entry_addr = previous_addr
+        binary_data.analysis_entry = previous_entry
+        global_vars.ANALYSIS_START_ADDR = previous_global_addr
+        ConcolicExecutor._state_cache.clear()
+        gc.collect()
+
+
+def _confirm_candidate_with_callers(
+    binary_data,
+    target_func,
+    target_violations,
+    security_properties,
+    args,
+    current_dir,
+    binary_name,
+    binary_path,
+):
+    callers = _find_direct_callers(binary_data, target_func, args.scan_confirm_max_callers)
+    if not callers:
+        if target_func.addr == binary_data.analysis_entry_addr:
+            return {
+                "status": "confirmed",
+                "callers": [],
+                "confirmed_by": "analysis_entry",
+                "reason": "entry_function",
+            }
+        return {
+            "status": "unconfirmed",
+            "callers": [],
+            "confirmed_by": "",
+            "reason": "no_direct_callers",
+        }
+
+    target_instruction_addrs = _function_instruction_addrs(target_func)
+    errors = []
+    checked = []
+    max_states = args.scan_confirm_max_states
+    for caller, callsite in callers:
+        caller_name = caller.name or f"sub_{caller.addr:x}"
+        checked.append(f"{caller_name}@{hex(callsite)}")
+        try:
+            report = _run_scan_entry(
+                binary_data,
+                caller,
+                security_properties,
+                args,
+                current_dir,
+                binary_name,
+                binary_path,
+                max_states=max_states,
+            )
+        except MemoryError as exc:
+            errors.append(f"{caller_name}: {exc}")
+            continue
+        except Exception as exc:
+            errors.append(f"{caller_name}: {exc}")
+            continue
+
+        overlapping = sorted(set(report.violations.keys()) & set(target_violations))
+        if overlapping and _report_mentions_function(
+            report,
+            target_func.name,
+            target_instruction_addrs,
+            properties=overlapping,
+        ):
+            return {
+                "status": "confirmed",
+                "callers": checked,
+                "confirmed_by": f"{caller_name}@{hex(callsite)}",
+                "reason": ",".join(overlapping),
+            }
+
+    if errors and len(errors) == len(callers):
+        return {
+            "status": "unknown",
+            "callers": checked,
+            "confirmed_by": "",
+            "reason": "; ".join(errors[:3]),
+        }
+    if errors:
+        return {
+            "status": "unknown",
+            "callers": checked,
+            "confirmed_by": "",
+            "reason": "; ".join(errors[:3]),
+        }
+    return {
+        "status": "unconfirmed",
+        "callers": checked,
+        "confirmed_by": "",
+        "reason": "no_caller_context_violation",
+    }
+
+
 def scan_all_functions(binary_path, security_properties, args):
     """Build the CFG once, then analyse every user function as a separate entry point."""
     import gc
@@ -672,6 +1080,7 @@ def scan_all_functions(binary_path, security_properties, args):
         cfg_fast_resolve_indirect_jumps=not args.cfg_fast_no_indirect_jumps,
         cfg_fast_normalize=not args.cfg_fast_no_normalize,
         cfg_fast_function_starts_only=False,
+        find_loops=not (args.cfg_skip_loopfinder or args.scan_skip_loopfinder),
     )
     emit_binary_load_summary(binary_data, "target")
 
@@ -679,12 +1088,15 @@ def scan_all_functions(binary_path, security_properties, args):
     # leaf/thunk/wrapper functions with no local variables can't have
     # stack buffer overflows and account for the majority of the function list.
     all_funcs = binary_data.functions
-    candidates = [f for f in all_funcs if _has_stack_frame(f, binary_data.cfg)]
+    candidates = [f for f in all_funcs if _is_scan_candidate(f, binary_data, args)]
     print(f"\n{len(all_funcs)} user functions found; {len(candidates)} have local stack frames — scanning those.\n")
 
     from src.model_checker.models.concolic_executor import _rss_mb
 
     all_violations = {}
+    low_confidence = {}
+    unconfirmed_violations = {}
+    confirmation_unknown = {}
     skipped = []        # (fname, reason)  — analysis errors
     oom_skipped = []    # (fname, rss_mb)  — memory-limit skips
     total_start = timer()
@@ -719,39 +1131,54 @@ def scan_all_functions(binary_path, security_properties, args):
 
         print(f"[{i}/{len(candidates)}] {fname} @ {hex(faddr)}", flush=True)
 
-        # Only clear the state cache between functions — PLT hooks stay in place.
-        ConcolicExecutor._state_cache.clear()
-        gc.collect()
-
-        binary_data.analysis_entry_addr = faddr
-        binary_data.analysis_entry = fname
-        global_vars.ANALYSIS_START_ADDR = faddr
-
         try:
-            constructor = StateSpaceConstructor(
+            report = _run_scan_entry(
                 binary_data,
-                binary_name,
-                current_dir,
-                binary_path,
-                args.max_iterations,
-                args.max_states,
-                args.max_recursion_depth,
-            )
-            constructor.construct_state_space()
-
-            model_checker = ModelChecker(
-                binary_name,
-                constructor.state_space,
+                func,
                 security_properties,
-                binary_data.address_to_function,
+                args,
+                current_dir,
+                binary_name,
+                binary_path,
             )
-            model_checker.state_space_transversal()
-            report = model_checker.create_report()
 
             violations = list(report.violations.keys())
             if violations:
-                all_violations[fname] = violations
-                print(f"  !! {', '.join(violations)}")
+                if args.scan_suppress_rbp_only and set(violations) == {"rbp_integrity"}:
+                    low_confidence[fname] = violations
+                    print(f"  LOW_CONFIDENCE: {', '.join(violations)}")
+                elif args.scan_confirm_callers:
+                    confirmation = _confirm_candidate_with_callers(
+                        binary_data,
+                        func,
+                        violations,
+                        security_properties,
+                        args,
+                        current_dir,
+                        binary_name,
+                        binary_path,
+                    )
+                    if confirmation["status"] == "confirmed":
+                        all_violations[fname] = violations
+                        print(
+                            f"  CONFIRMED: {', '.join(violations)} "
+                            f"via {confirmation['confirmed_by']}"
+                        )
+                    elif confirmation["status"] == "unknown":
+                        confirmation_unknown[fname] = (violations, confirmation)
+                        print(
+                            f"  UNKNOWN_CONTEXT: {', '.join(violations)} "
+                            f"({confirmation['reason']})"
+                        )
+                    else:
+                        unconfirmed_violations[fname] = (violations, confirmation)
+                        print(
+                            f"  UNCONFIRMED: {', '.join(violations)} "
+                            f"({confirmation['reason']})"
+                        )
+                else:
+                    all_violations[fname] = violations
+                    print(f"  !! {', '.join(violations)}")
             else:
                 print(f"  OK")
         except MemoryError:
@@ -776,11 +1203,26 @@ def scan_all_functions(binary_path, security_properties, args):
 
     total_elapsed = timer() - total_start
 
-    n_clean = len(candidates) - len(all_violations) - len(skipped) - len(oom_skipped)
+    n_clean = (
+        len(candidates)
+        - len(all_violations)
+        - len(low_confidence)
+        - len(unconfirmed_violations)
+        - len(confirmation_unknown)
+        - len(skipped)
+        - len(oom_skipped)
+    )
 
     print("\n" + "=" * 60)
     print(f"Scan complete: {len(candidates)} functions in {total_elapsed:.1f}s")
+    if args.scan_confirm_callers:
+        raw_candidates = len(all_violations) + len(unconfirmed_violations) + len(confirmation_unknown)
+        print(f"  Candidates:   {raw_candidates}")
+        print(f"  Confirmed:    {len(all_violations)}")
+        print(f"  Unconfirmed:  {len(unconfirmed_violations)}")
+        print(f"  Context unknown: {len(confirmation_unknown)}")
     print(f"  Vulnerable:   {len(all_violations)}")
+    print(f"  Low-confidence: {len(low_confidence)}")
     print(f"  Clean:        {n_clean}")
     print(f"  Skipped (OOM): {len(oom_skipped)}")
     print(f"  Skipped (err): {len(skipped)}")
@@ -789,6 +1231,23 @@ def scan_all_functions(binary_path, security_properties, args):
         print("\n-- Vulnerable functions --")
         for fname, viols in all_violations.items():
             print(f"  {fname}: {', '.join(viols)}")
+
+    if low_confidence:
+        print("\n-- Low-confidence functions --")
+        for fname, viols in low_confidence.items():
+            print(f"  {fname}: {', '.join(viols)}")
+
+    if unconfirmed_violations:
+        print("\n-- Unconfirmed functions --")
+        for fname, (viols, confirmation) in unconfirmed_violations.items():
+            callers = ";".join(confirmation["callers"])
+            print(f"  {fname}: {', '.join(viols)} [{confirmation['reason']}] callers={callers}")
+
+    if confirmation_unknown:
+        print("\n-- Caller-context unknown functions --")
+        for fname, (viols, confirmation) in confirmation_unknown.items():
+            callers = ";".join(confirmation["callers"])
+            print(f"  {fname}: {', '.join(viols)} [{confirmation['reason']}] callers={callers}")
 
     if oom_skipped:
         print("\n-- Skipped (memory limit) --")
@@ -804,10 +1263,22 @@ def scan_all_functions(binary_path, security_properties, args):
     with open(report_path, "w") as f:
         f.write(f"BASICS function scan: {binary_path}\n")
         f.write(f"Functions total: {len(all_funcs)} | with stack frames: {len(candidates)}\n")
+        f.write(f"Caller-context confirmation: {args.scan_confirm_callers}\n")
         f.write(f"Elapsed: {total_elapsed:.1f}s\n\n")
         f.write("== Vulnerable ==\n")
         for fname, viols in all_violations.items():
             f.write(f"  {fname}: {', '.join(viols)}\n")
+        f.write("\n== Low-confidence ==\n")
+        for fname, viols in low_confidence.items():
+            f.write(f"  {fname}: {', '.join(viols)}\n")
+        f.write("\n== Unconfirmed ==\n")
+        for fname, (viols, confirmation) in unconfirmed_violations.items():
+            callers = ";".join(confirmation["callers"])
+            f.write(f"  {fname}: {', '.join(viols)} [{confirmation['reason']}] callers={callers}\n")
+        f.write("\n== Caller-context unknown ==\n")
+        for fname, (viols, confirmation) in confirmation_unknown.items():
+            callers = ";".join(confirmation["callers"])
+            f.write(f"  {fname}: {', '.join(viols)} [{confirmation['reason']}] callers={callers}\n")
         f.write("\n== Skipped (memory limit) ==\n")
         for fname, rss in oom_skipped:
             f.write(f"  {fname}  (RSS {rss:.0f} MB)\n")
@@ -850,11 +1321,15 @@ def main():
     global_vars.CONCOLIC_STEP_LIMIT = args.concolic_step_limit
     global_vars.CONCOLIC_ACTIVE_LIMIT = args.concolic_active_limit
     global_vars.LTL_BACKEND = args.ltl_backend
+    global_vars.SCAN_EXCLUDE_RUNTIME_SYMBOLS = not args.scan_include_runtime_symbols
+    global_vars.SCAN_CONSTRAIN_ARG_REGS = args.scan_constrain_arg_regs
+    global_vars.SCAN_ARG_STACK_GUARD_BYTES = args.scan_arg_stack_guard_bytes
     if args.memory_limit_mb is None and args.scan_memory_limit_mb is not None:
         args.memory_limit_mb = args.scan_memory_limit_mb
     global_vars.SCAN_MEMORY_LIMIT_MB = args.memory_limit_mb
     global_vars.MEMORY_LIMIT_MB = args.memory_limit_mb
     global_vars.INCLUDE_EXPERIMENTAL_PROPERTIES = args.include_experimental_properties
+    _apply_hard_memory_limit(args.hard_memory_limit_mb)
 
     if args.inspect_patch_only is not None:
         inspect_existing_patch(args.binary_path, args.inspect_patch_only, args)

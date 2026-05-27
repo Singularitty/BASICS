@@ -76,11 +76,16 @@ def main() -> None:
     parser.add_argument("--project", action="append", default=[], help="Filter by project name, repeatable.")
     parser.add_argument("--case-id", action="append", default=[], help="Filter binary case id substring, repeatable.")
     parser.add_argument("--symbol-regex", default=DEFAULT_SYMBOL_RE)
-    parser.add_argument("--max-functions-per-binary", type=int, default=20)
+    parser.add_argument(
+        "--max-functions-per-binary",
+        type=int,
+        default=None,
+        help="Optional cap on selected functions per binary. By default all matching symbols are included.",
+    )
     parser.add_argument(
         "--all-symbols",
         action="store_true",
-        help="Include all defined user text symbols and remove the default per-binary limit.",
+        help="Include all defined user text symbols.",
     )
     parser.add_argument("--include-main", action="store_true")
     args = parser.parse_args()
@@ -94,7 +99,7 @@ def main() -> None:
         cases = [case for case in cases if any(needle in case["case_id"].lower() for needle in needles)]
 
     symbol_regex = ".*" if args.all_symbols else args.symbol_regex
-    max_functions_per_binary = None if args.all_symbols else args.max_functions_per_binary
+    max_functions_per_binary = args.max_functions_per_binary
     pattern = re.compile(symbol_regex)
     out_cases = []
     for case in cases:
