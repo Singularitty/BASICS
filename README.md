@@ -1,54 +1,103 @@
-# BASICS: Binary Analysis and Stack Integrity Checker System
-Model Checking tool to verify LTL properties in stack memory of binary programs
+# BASICS
 
-# Requirements
+BASICS is a binary-analysis prototype for checking stack-memory safety
+properties and patching common stack buffer overflows in ELF binaries. The code
+is mostly Python, with small C patch stubs under
+`src/vulnerability_identifier_removal/patches`.
 
-## Recomended
-- PyPy is necessary to obtain better performance, we recommend setting a virtualenv with pyenv, using the PyPy Interpreter
+## Setup
 
-## Required Software
-In order for the tool to run you must install the following programs:  
-- Graphviz
-- Rust Compiler
-- E9Patch
-- Spot with Python bindings
+Use Python 3.11. The pinned angr version in `requirements.txt` is not meant for
+newer Python releases.
 
-## Python Packages
-- angr
-- angr-utils
-- pwntools
-- rustworkx
-- lark
-- numpy
-
-# Running
-
-Use the wrapper script to create/use the project virtual environment and run BASICS:
+On a fresh Ubuntu-like machine, install the system pieces first:
 
 ```bash
-./run_basics.sh --help
+sudo apt-get update
+sudo apt-get install -y graphviz gcc gdb git make patchelf python3.11 python3.11-venv
+```
+
+Then let the wrapper create the local environment:
+
+```bash
+PYTHON_BIN=python3.11 ./run_basics.sh --help
+```
+
+`run_basics.sh` creates `.venv`, installs `requirements.txt`, adds `.tools/bin`
+to `PATH`, and then forwards the remaining arguments to `src/main.py`.
+
+For patching runs, put `e9tool` on `PATH`. Without it, the wrapper falls back
+to analysis-only mode. For LTL translation, install Spot or `ltl2ba`; if neither
+is available, BASICS reuses the checked-in automata cache. On Arch Linux,
+`./install_arch.sh` installs the usual toolchain and builds E9Patch locally.
+
+## Run BASICS
+
+Build the small C fixtures and run one binary:
+
+```bash
+./tests/build_c_cases.sh
 ./run_basics.sh tests/bin/unsafe_strcpy_argv
-./run_basics.sh --function-simulation static --patched-function-simulation angr tests/bin/unsafe_sprintf
 ```
 
-The wrapper uses `.venv`, adds `.tools/bin` to `PATH`, installs `requirements.txt` when needed, and forwards all arguments to `src/main.py`.
-
-By default, analysis starts at `main`. To force the checker to start at the ELF loader entry point, use:
+Useful variants:
 
 ```bash
-./run_basics.sh --no-patching --analysis-entry loader tests/bin/program_patched
+./run_basics.sh --no-patching tests/bin/safe_strncpy
+./run_basics.sh --cfg-mode fast --function-simulation static tests/bin/unsafe_sprintf
+./run_basics.sh --no-patching --analysis-entry loader tests/bin/unsafe_strcpy_argv
 ```
 
-For E9-patched validation, BASICS writes `reports/<binary>/patch_validation.json` with bounded malicious-input remediation checks, benign/boundary regression checks, and optional GDB patch-site contracts. BASICS explicitly does not claim full functional equivalence. The rationale and paper-facing validation claim are documented in [docs/e9patch_validation.md](/home/luisf/Work/Projects/BASICS/docs/e9patch_validation.md).
+Analysis starts at `main` unless `--analysis-entry loader` is used. Patch
+validation writes reports under `reports/<binary>/`.
 
-Juliet CWE-121 benchmark coverage and the conservative stack models for indexed writes and concrete `alloca` memory copies are documented in [docs/juliet_cwe121_modeling.md](/home/luisf/Work/Projects/BASICS/docs/juliet_cwe121_modeling.md).
+## Tests
 
-The current SARD bounded patch-validation experiment is documented in [docs/sard_patch_validation_experiment.md](/home/luisf/Work/Projects/BASICS/docs/sard_patch_validation_experiment.md).
-
-Experimental LTL properties are disabled by default. Enable them explicitly with `--include-experimental-properties` when running exploratory analyses.
-
-BASICS uses Python 3.11 because `angr==9.2.102` is not compatible with Python 3.14. If `pyenv` is installed, the wrapper uses `.python-version` and installs Python 3.11.9 automatically when needed. You can override the interpreter with:
+The unit tests are small enough to run locally:
 
 ```bash
-PYTHON_BIN=/path/to/python3.11 ./run_basics.sh --help
+python -m unittest discover -s tests
 ```
+
+If fixture binaries need to be rebuilt:
+
+```bash
+./tests/build_c_cases.sh
+```
+
+## Reproduce Benchmarks
+
+The reproducibility wrapper records every command it runs under
+`Benchmarks/reproducibility/<run-id>/commands.log`.
+
+Show the full command sequence without running it:
+
+```bash
+python3 benchmarks/run_basics_repro.py --suite all --phase all --dry-run
+```
+
+Run a small stack-benchmark smoke test:
+
+```bash
+python3 benchmarks/run_basics_repro.py --suite stack --phase all --limit 5
+```
+
+Run the prepared SARD and Juliet stack manifests directly:
+
+```bash
+scripts/run_compiled_stack_benchmarks.sh all --jobs auto --timeout 180
+```
+
+For the focused Juliet OOM/error reruns:
+
+```bash
+scripts/run_juliet_oom_benchmarks.sh repro --prepare --jobs 1
+scripts/run_juliet_oom_benchmarks.sh direct-repro --timeout 1800
+```
+
+The OSS and Linux-package suites need network access and an Ubuntu-like host.
+They prepare binaries and manifests under `Benchmarks/` and write result CSV,
+JSON, and stats files next to each run.
+
+Generated benchmark corpora, scan reports, virtualenvs, downloaded tools, and
+result directories are intentionally left out of git.
