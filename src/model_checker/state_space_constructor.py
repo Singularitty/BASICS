@@ -189,6 +189,7 @@ class StateSpaceConstructor:
     def __process_loop(self, node, current_state) -> MemoryState:
         if not global_vars.SCAN_MODE:
             print("Loop detected.\nPerforming loop emulation...")
+        fname = self.__function_name_for_node(node)
         loop = next(filter(lambda l: l.continue_edges[0][0].addr == node.addr, self.loops), None)
         if loop is not None and self.__loop_has_only_scalar_counter_writes(loop):
             if not global_vars.SCAN_MODE:
@@ -206,10 +207,10 @@ class StateSpaceConstructor:
                 print("Loop emulation successful.")
             except FailedConcolicExecution:
                 print("Failed to execute loop. Skipping loop emulation.")
-                difs = []
+                difs = self.__static_loop_stack_write_indices(loop, current_state, fname, node)
             except FailedLoopUnrolling:
                 print("Failed to unroll loop. Skipping loop emulation.")
-                difs = []
+                difs = self.__static_loop_stack_write_indices(loop, current_state, fname, node)
             finally:
                 ret_unc = angr.SIM_PROCEDURES["stubs"]["ReturnUnconstrained"]
                 for addr in GLOBAL_HOOKS:
@@ -217,7 +218,7 @@ class StateSpaceConstructor:
                         self.project.hook(addr, ret_unc())
         except FailedLoopUnrolling:
             print("Failed to unroll loop. Skipping loop emulation.")
-            return current_state
+            difs = self.__static_loop_stack_write_indices(loop, current_state, fname, node)
         if len(difs) > 0:
             old_frame = current_state.get_stack_frame(fname)
             new_frame = old_frame.write_multiple_bytes(difs)
@@ -228,6 +229,100 @@ class StateSpaceConstructor:
             self.state_space.add_transition(current_state, next_state, MemoryTransition(jump_ins, self.cfg))
             return next_state
         return current_state
+
+    def __function_name_for_node(self, node):
+        try:
+            func = self.cfg.kb.functions.get_by_addr(node.function_address)
+            if func is not None:
+                return func.name
+        except Exception:
+            pass
+        return node.name.split("+")[0] if node.name is not None else f"sub_{node.addr:x}"
+
+    def __static_loop_stack_write_indices(self, loop, current_state, function_name, loop_node):
+        """Conservative fallback for simple stack-copy loops when angr loop emulation fails."""
+        if loop is None or not current_state.contains_stack_frame(function_name):
+            return []
+        aliases = self.__stack_pointer_aliases_until(loop_node)
+        body_nodes = sorted(getattr(loop, "body_nodes", []), key=lambda n: n.addr)
+        for body_node in body_nodes:
+            try:
+                block = self.project.factory.block(body_node.addr)
+            except Exception:
+                continue
+            for ins in block.capstone.insns:
+                self.__update_stack_aliases(ins, aliases)
+                if not ins.operands:
+                    continue
+                dst = ins.operands[0]
+                if dst.type != X86_OP_MEM:
+                    continue
+                mem = dst.value.mem
+                base = self.__canonical_ins_register(ins, mem.base)
+                index = self.__canonical_ins_register(ins, mem.index)
+                base_target = aliases.get(base)
+                if base_target not in ("rsp", "rbp"):
+                    continue
+                if index is not None:
+                    frame = current_state.get_stack_frame(function_name)
+                    if global_vars.DEBUG:
+                        print(
+                            f"Static loop fallback: indexed stack write at {hex(ins.address)} "
+                            f"via {base}+{index}; using full-frame write."
+                        )
+                    return list(range(frame.get_stack_size()))
+        return []
+
+    def __stack_pointer_aliases_until(self, loop_node):
+        aliases = {"rsp": "rsp", "rbp": "rbp"}
+        try:
+            func = self.cfg.kb.functions.get_by_addr(loop_node.function_address)
+            block_addrs = sorted(func.block_addrs)
+        except Exception:
+            block_addrs = [loop_node.addr]
+        for addr in block_addrs:
+            if addr >= loop_node.addr:
+                continue
+            try:
+                block = self.project.factory.block(addr)
+            except Exception:
+                continue
+            for ins in block.capstone.insns:
+                self.__update_stack_aliases(ins, aliases)
+        return aliases
+
+    def __update_stack_aliases(self, ins, aliases):
+        if len(ins.operands) < 2:
+            return
+        dst = ins.operands[0]
+        src = ins.operands[1]
+        if dst.type != X86_OP_REG:
+            return
+        dst_reg = self.__canonical_ins_register(ins, dst.reg)
+        if ins.mnemonic == "mov" and src.type == X86_OP_REG:
+            src_reg = self.__canonical_ins_register(ins, src.reg)
+            if src_reg in aliases:
+                aliases[dst_reg] = aliases[src_reg]
+            else:
+                aliases.pop(dst_reg, None)
+        elif ins.mnemonic == "lea" and src.type == X86_OP_MEM:
+            base = self.__canonical_ins_register(ins, src.value.mem.base)
+            if base in aliases:
+                aliases[dst_reg] = aliases[base]
+            else:
+                aliases.pop(dst_reg, None)
+        elif ins.mnemonic in ("add", "sub") and dst_reg not in ("rsp", "rbp"):
+            aliases.pop(dst_reg, None)
+
+    def __canonical_ins_register(self, ins, reg_id):
+        if reg_id == 0:
+            return None
+        name = ins.reg_name(reg_id)
+        aliases = {
+            "esp": "rsp", "sp": "rsp", "spl": "rsp",
+            "ebp": "rbp", "bp": "rbp", "bpl": "rbp",
+        }
+        return aliases.get(name, name)
 
     def __loop_has_only_scalar_counter_writes(self, loop):
         saw_write = False
@@ -325,7 +420,10 @@ class StateSpaceConstructor:
                         stack_changes = call.stack_changes
                         #print(stack_changes)
                         if len(stack_changes) == 0:
-                            return current_state
+                            if call.function_name == "gets":
+                                next_state = current_state.add_instruction(ins)
+                            else:
+                                return current_state
                         else:
                             old_frame = current_state.get_stack_frame(function_name)
                             new_frame = old_frame.write_multiple_bytes(stack_changes)

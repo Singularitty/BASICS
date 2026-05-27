@@ -5,10 +5,12 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
-import sys
 import time
 import shlex
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +18,23 @@ from pathlib import Path
 ROOT = Path(os.environ.get("BASICS_BENCH_ROOT", Path(__file__).resolve().parents[1])).resolve()
 DEFAULT_MANIFEST = ROOT / "Benchmarks" / "stack_benchmark" / "stack_cases_combined.json"
 RESULTS_DIR = ROOT / "Benchmarks" / "stack_benchmark" / "external_results"
+COMPILE_LOCK = threading.Lock()
+PRINT_LOCK = threading.Lock()
+STOP_EVENT = threading.Event()
+CODEQL_DEFAULT_QUERY = "codeql/cpp-queries:codeql-suites/cpp-security-extended.qls"
+CODEQL_EXTRA_QUERIES = (
+    ROOT
+    / "tools"
+    / "codeql"
+    / "qlpacks"
+    / "codeql"
+    / "cpp-queries"
+    / "1.6.2"
+    / "Security"
+    / "CWE"
+    / "CWE-129"
+    / "ImproperArrayIndexValidation.ql",
+)
 
 CWE_RE = re.compile(r"\bCWE[-_ ]?(\d{2,4})\b", re.IGNORECASE)
 CWE_CHECKER_BO_IDS = {"119", "787"}
@@ -32,6 +51,12 @@ MEMCHECK_RE = re.compile(
 )
 BAI_RE = re.compile(r"\b(?:CWE119|CWE125|CWE676|CWE787)\b|\bOut[- ]of[- ]bounds\b|\bBuffer Overflow\b", re.IGNORECASE)
 MANTICORE_RE = re.compile(r"\b(crash|crashed|SIGSEGV|segmentation fault|invalid memory|memory violation)\b", re.IGNORECASE)
+MANTICORE_INFRA_RE = re.compile(
+    r"version [`']GLIBC_[^`']+[`'] not found|"
+    r"No such file or directory|"
+    r"error while loading shared libraries",
+    re.IGNORECASE,
+)
 ARBITER_REPORTS_RE = re.compile(r"^ARBITER_REPORTS:\s*([1-9]\d*)\b", re.MULTILINE)
 
 
@@ -80,15 +105,21 @@ def ensure_binary(case, compile_missing=False):
     cmd = compile_info.get("command") or []
     if not cmd:
         return None, "compile_command_missing"
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
-    if proc.returncode != 0:
-        return None, f"compile_failed:{proc.stdout[-800:]}"
-    if binary.exists():
-        return binary, None
-    alt = resolve_juliet_individual_binary(binary)
-    if alt is not None:
-        return alt, None
+    with COMPILE_LOCK:
+        if binary.exists():
+            return binary, None
+        alt = resolve_juliet_individual_binary(binary)
+        if alt is not None:
+            return alt, None
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        proc = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+        if proc.returncode != 0:
+            return None, f"compile_failed:{proc.stdout[-800:]}"
+        if binary.exists():
+            return binary, None
+        alt = resolve_juliet_individual_binary(binary)
+        if alt is not None:
+            return alt, None
     return None, "compile_finished_binary_missing"
 
 
@@ -419,11 +450,14 @@ def run_rex(binary, case, timeout_sec):
 
 
 def run_manticore(binary, case, timeout_sec):
-    del case
     if not docker_image_exists("trailofbits/manticore:latest"):
         return {"status": "tool_missing", "error": "manticore_missing", "output": "", "returncode": ""}
+    binary, build_error = build_manticore_binary(binary, case)
+    if build_error:
+        return {"status": "compile_error", "error": build_error, "output": "", "returncode": ""}
     mount, inner = docker_mount_for(binary)
     workspace = ROOT / ".tool_tmp" / "manticore_workspace" / binary.stem
+    shutil.rmtree(workspace, ignore_errors=True)
     workspace.mkdir(parents=True, exist_ok=True)
     cmd = [
         "docker", "run", "--rm",
@@ -434,8 +468,84 @@ def run_manticore(binary, case, timeout_sec):
         f"/input/{Path(inner).name}",
     ]
     rc, out, err = run_interruptible(cmd, timeout_sec + 10)
+    testcase_errors = []
+    for stderr_path in sorted(workspace.glob("test_*.stderr")):
+        text = stderr_path.read_text(encoding="utf-8", errors="replace")
+        if text.strip():
+            testcase_errors.append(f"{stderr_path.name}:\n{text.strip()}")
+    if testcase_errors:
+        out += "\nMANTICORE_TESTCASE_STDERR:\n" + "\n\n".join(testcase_errors[:8])
+    infra_error = next((text for text in testcase_errors if MANTICORE_INFRA_RE.search(text)), None)
+    if infra_error:
+        return {
+            "status": "run_error",
+            "error": "manticore_runtime_infra_error",
+            "output": out,
+            "returncode": rc,
+        }
     status = "timeout" if err else ("ok" if rc == 0 else "run_error")
     return {"status": status, "error": err or (f"exit={rc}" if status == "run_error" else ""), "output": out, "returncode": rc}
+
+
+def build_manticore_binary(binary, case):
+    compile_cmd = case.get("compile", {}).get("command") or []
+    if not compile_cmd or Path(str(compile_cmd[0])).name not in {"gcc", "cc"}:
+        return binary, None
+
+    case_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(case.get("case_id", binary.stem)))
+    out_dir = ROOT / ".tool_tmp" / "manticore_bins" / case_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rebuilt = out_dir / binary.name
+    if rebuilt.exists():
+        return rebuilt, None
+
+    docker_cmd = []
+    skip_next = False
+    old_roots = [
+        "/home/ubuntu/BASICS",
+        "/home/luisf/Work/Projects/BASICS",
+        str(ROOT),
+    ]
+    for index, part in enumerate(compile_cmd):
+        if skip_next:
+            skip_next = False
+            continue
+        text = str(part)
+        if text == "-o":
+            docker_cmd.extend(["-o", f"/work/{rebuilt.relative_to(ROOT)}"])
+            skip_next = True
+            continue
+        for old_root in old_roots:
+            if text.startswith(old_root + "/"):
+                text = "/work/" + text[len(old_root) + 1 :]
+                break
+        else:
+            if text.startswith("Benchmarks/"):
+                text = "/work/" + text
+        docker_cmd.append(text)
+
+    if "-o" not in [str(part) for part in compile_cmd]:
+        docker_cmd.extend(["-o", f"/work/{rebuilt.relative_to(ROOT)}"])
+
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{ROOT}:/work",
+        "-w",
+        "/work",
+        "trailofbits/manticore:latest",
+        *docker_cmd,
+    ]
+    rc, out, err = run_interruptible(cmd, 120)
+    if err:
+        return binary, f"manticore_rebuild_timeout:{out[-800:]}"
+    if rc != 0:
+        return binary, f"manticore_rebuild_failed:{out[-800:]}"
+    if not rebuilt.exists():
+        return binary, "manticore_rebuild_missing_output"
+    return rebuilt, None
 
 
 def run_flawfinder(binary, case, timeout_sec):
@@ -485,6 +595,7 @@ def run_codeql(binary, case, timeout_sec):
     if compile_cmd:
         normalized = []
         old_roots = [
+            "/home/ubuntu/BASICS",
             "/home/luisf/Work/Projects/BASICS",
             str(Path(__file__).resolve().parents[1]),
         ]
@@ -494,6 +605,10 @@ def run_codeql(binary, case, timeout_sec):
                 if text.startswith(old_root + "/"):
                     text = str(ROOT / text[len(old_root) + 1:])
                     break
+            else:
+                candidate = ROOT / text
+                if text.startswith("Benchmarks/") or candidate.exists():
+                    text = str(candidate)
             normalized.append(text)
         build_cmd = " ".join(shlex.quote(part) for part in normalized)
     else:
@@ -507,16 +622,24 @@ def run_codeql(binary, case, timeout_sec):
             ]
         )
 
+    codeql_threads = os.environ.get("CODEQL_THREADS", "1")
+    codeql_ram = os.environ.get("CODEQL_RAM_MB", "4096")
+
     create_cmd = [
         codeql, "database", "create", str(db),
         "--language=cpp",
-        "--source-root", str(ROOT),
+        "--source-root", str(source.parent),
         "--command", build_cmd,
+        "--threads", codeql_threads,
         "--overwrite",
     ]
+    query_specs = [CODEQL_DEFAULT_QUERY]
+    query_specs.extend(str(path) for path in CODEQL_EXTRA_QUERIES if path.exists())
     analyze_cmd = [
         codeql, "database", "analyze", str(db),
-        "codeql/cpp-queries:codeql-suites/cpp-security-extended.qls",
+        *query_specs,
+        "--threads", codeql_threads,
+        "--ram", codeql_ram,
         "--format=sarif-latest",
         "--output", str(sarif),
     ]
@@ -692,6 +815,25 @@ def run_case(tool, case, logs_dir, timeout_sec, compile_missing=False):
     return row
 
 
+def print_progress(message):
+    with PRINT_LOCK:
+        print(message, flush=True)
+
+
+def run_case_job(tool, idx, total, case, logs_dir, timeout_sec, compile_missing):
+    if STOP_EVENT.is_set():
+        row = empty_row(case, tool)
+        row["status"] = "interrupted"
+        row["error"] = "skipped_after_interrupt"
+        return tool, idx, row
+    row = run_case(tool, case, logs_dir, timeout_sec, compile_missing=compile_missing)
+    print_progress(
+        f"[{tool} {idx}/{total}] {case['case_id']}: "
+        f"{row['status']} reported={row['reported_vuln']} cwes={row['reported_cwes']}"
+    )
+    return tool, idx, row
+
+
 def write_results(out_dir, rows):
     fieldnames = list(empty_row({"case_id": ""}, "tool").keys())
     csv_path = out_dir / "results.csv"
@@ -735,6 +877,12 @@ def main():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--timeout-sec", type=int, default=300)
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel case workers across the selected tool/case matrix. Use 1 for sequential execution.",
+    )
+    parser.add_argument(
         "--compile-missing",
         action="store_true",
         help="Compile missing binaries on demand. Standard benchmark flow leaves this off and runs scripts/prepare_external_benchmarks.py first.",
@@ -762,18 +910,67 @@ def main():
         cases = [c for c in cases if c.get("label_rule") not in skip]
     if args.limit is not None:
         cases = cases[: args.limit]
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    rows = []
+    rows_by_tool = {tool: [] for tool in tools}
+    out_dirs = {}
+    logs_dirs = {}
     for tool in tools:
         out_dir = RESULTS_DIR / tool / timestamp
         logs_dir = out_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
-        for idx, case in enumerate(cases, start=1):
-            row = run_case(tool, case, logs_dir, args.timeout_sec, compile_missing=args.compile_missing)
-            rows.append(row)
-            print(f"[{tool} {idx}/{len(cases)}] {case['case_id']}: {row['status']} reported={row['reported_vuln']} cwes={row['reported_cwes']}")
-        csv_path, json_path = write_results(out_dir, [r for r in rows if r["tool"] == tool])
+        out_dirs[tool] = out_dir
+        logs_dirs[tool] = logs_dir
+
+    jobs = [
+        (tool, idx, case)
+        for tool in tools
+        for idx, case in enumerate(cases, start=1)
+    ]
+    if not jobs:
+        print_progress("No matching cases selected; writing empty result files.")
+    elif args.workers == 1:
+        for tool, idx, case in jobs:
+            _, _, row = run_case_job(
+                tool, idx, len(cases), case, logs_dirs[tool], args.timeout_sec, args.compile_missing
+            )
+            rows_by_tool[tool].append((idx, row))
+    else:
+        print_progress(
+            f"Running {len(jobs)} tool/case job(s) with {min(args.workers, len(jobs))} worker(s)."
+        )
+        executor = ThreadPoolExecutor(max_workers=min(args.workers, len(jobs)))
+        futures = {
+            executor.submit(
+                run_case_job,
+                tool,
+                idx,
+                len(cases),
+                case,
+                logs_dirs[tool],
+                args.timeout_sec,
+                args.compile_missing,
+            )
+            for tool, idx, case in jobs
+        }
+        try:
+            while futures:
+                done, futures = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    tool, idx, row = future.result()
+                    rows_by_tool[tool].append((idx, row))
+        except KeyboardInterrupt:
+            STOP_EVENT.set()
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+
+    for tool in tools:
+        rows = [row for _, row in sorted(rows_by_tool[tool], key=lambda item: item[0])]
+        csv_path, json_path = write_results(out_dirs[tool], rows)
         print(f"Wrote {tool} results:\n  CSV: {csv_path}\n  JSON: {json_path}")
 
 

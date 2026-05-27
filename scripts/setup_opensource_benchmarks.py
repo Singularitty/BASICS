@@ -95,6 +95,71 @@ PROJECTS: dict[str, Project] = {
         ),
         description="IEC 61850/MMS library used in substation automation.",
     ),
+    "libmodbus": Project(
+        name="libmodbus",
+        repo="https://github.com/stephane/libmodbus.git",
+        build=(
+            ("./autogen.sh",),
+            ("./configure", "--enable-static=no", "CFLAGS=-g -O0 -fno-omit-frame-pointer"),
+            ("make", "-j{jobs}"),
+        ),
+        description="Modbus protocol library with tests and utilities.",
+    ),
+    "mosquitto": Project(
+        name="mosquitto",
+        repo="https://github.com/eclipse-mosquitto/mosquitto.git",
+        build=(
+            (
+                "cmake",
+                "-S",
+                ".",
+                "-B",
+                "build",
+                "-DCMAKE_BUILD_TYPE=Debug",
+                "-DWITH_DOCS=OFF",
+                "-DWITH_TLS=OFF",
+                "-DWITH_CJSON=ON",
+            ),
+            ("cmake", "--build", "build", "--parallel", "{jobs}"),
+        ),
+        description="MQTT broker/client implementation in C.",
+    ),
+    "libuv": Project(
+        name="libuv",
+        repo="https://github.com/libuv/libuv.git",
+        build=(
+            ("cmake", "-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Debug", "-DBUILD_TESTING=ON"),
+            ("cmake", "--build", "build", "--parallel", "{jobs}"),
+        ),
+        description="Cross-platform asynchronous I/O library with test binaries.",
+    ),
+    "mbedtls": Project(
+        name="mbedtls",
+        repo="https://github.com/Mbed-TLS/mbedtls.git",
+        build=(
+            ("cmake", "-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Debug", "-DENABLE_TESTING=ON", "-DENABLE_PROGRAMS=ON"),
+            ("cmake", "--build", "build", "--parallel", "{jobs}"),
+        ),
+        description="TLS/crypto library with command-line programs and tests.",
+    ),
+    "libyaml": Project(
+        name="libyaml",
+        repo="https://github.com/yaml/libyaml.git",
+        build=(
+            ("cmake", "-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Debug", "-DBUILD_TESTING=ON"),
+            ("cmake", "--build", "build", "--parallel", "{jobs}"),
+        ),
+        description="YAML parser/emitter library and tests.",
+    ),
+    "cjson": Project(
+        name="cjson",
+        repo="https://github.com/DaveGamble/cJSON.git",
+        build=(
+            ("cmake", "-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Debug", "-DENABLE_CJSON_TEST=ON"),
+            ("cmake", "--build", "build", "--parallel", "{jobs}"),
+        ),
+        description="Small C JSON parser with test binaries.",
+    ),
 }
 
 
@@ -158,7 +223,7 @@ def discover_binaries(project_dir: Path) -> list[Path]:
     return sorted(binaries)
 
 
-def build_manifest(selected: list[Project], max_binaries_per_project: int | None) -> dict:
+def build_manifest(selected: list[Project], max_binaries_per_project: int | None, failures: dict[str, str] | None = None) -> dict:
     cases = []
     for project in selected:
         project_dir = BASE / "src" / project.name
@@ -186,6 +251,7 @@ def build_manifest(selected: list[Project], max_binaries_per_project: int | None
     return {
         "generated_by": "scripts/setup_opensource_benchmarks.py",
         "note": "Unlabeled real-project binaries for BASICS smoke/triage runs.",
+        "setup_failures": failures or {},
         "cases": cases,
     }
 
@@ -214,6 +280,7 @@ def main() -> None:
     parser.add_argument("--list-projects", action="store_true")
     parser.add_argument("--skip-clone", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--keep-going", action="store_true", help="Continue when a clone/build fails and record the failure in the manifest.")
     parser.add_argument("--update", action="store_true", help="git pull existing clones before building.")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--timeout-sec", type=int, default=900)
@@ -235,15 +302,22 @@ def main() -> None:
     selected = parse_projects(args.project)
     BASE.mkdir(parents=True, exist_ok=True)
 
+    failures: dict[str, str] = {}
     for project in selected:
         project_dir = BASE / "src" / project.name
         print(f"\n== {project.name} ==", flush=True)
-        if not args.skip_clone:
-            clone_or_update(project, project_dir, args.timeout_sec, args.update)
-        if not args.skip_build:
-            build_project(project, project_dir, args.jobs, args.timeout_sec)
+        try:
+            if not args.skip_clone:
+                clone_or_update(project, project_dir, args.timeout_sec, args.update)
+            if not args.skip_build:
+                build_project(project, project_dir, args.jobs, args.timeout_sec)
+        except Exception as exc:
+            failures[project.name] = str(exc)
+            print(f"!! {project.name} failed: {exc}", flush=True)
+            if not args.keep_going:
+                raise
 
-    manifest = build_manifest(selected, args.max_binaries_per_project)
+    manifest = build_manifest(selected, args.max_binaries_per_project, failures)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -254,6 +328,10 @@ def main() -> None:
     print(f"\nWrote {len(manifest['cases'])} cases to {args.out.relative_to(ROOT)}")
     for project, count in sorted(counts.items()):
         print(f"  {project}: {count}")
+    if failures:
+        print("\nFailures:")
+        for project, reason in sorted(failures.items()):
+            print(f"  {project}: {reason}")
 
 
 if __name__ == "__main__":

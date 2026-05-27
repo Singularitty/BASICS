@@ -1,4 +1,5 @@
 import angr
+import claripy
 import os
 
 from src import global_vars
@@ -51,7 +52,30 @@ class ConcolicExecutor:
         }
         if global_vars.ANGR_OPTION is not None:
             kwargs["mode"] = global_vars.ANGR_OPTION
-        return project.factory.blank_state(**kwargs)
+        state = project.factory.blank_state(**kwargs)
+        cls._constrain_scan_entry_args(state)
+        return state
+
+    @staticmethod
+    def _constrain_scan_entry_args(state):
+        """Avoid impossible function-entry callers that pass this frame's stack as an arg."""
+        if not global_vars.SCAN_MODE or not global_vars.SCAN_CONSTRAIN_ARG_REGS:
+            return
+        try:
+            sp = state.solver.eval(state.regs.rsp)
+        except Exception:
+            return
+        guard = int(global_vars.SCAN_ARG_STACK_GUARD_BYTES or 0)
+        if guard <= 0:
+            return
+        bits = state.arch.bits
+        low = claripy.BVV(max(0, sp - guard), bits)
+        high = claripy.BVV(sp + guard, bits)
+        for reg_name in ("rdi", "rsi", "rdx", "rcx", "r8", "r9"):
+            if not hasattr(state.regs, reg_name):
+                continue
+            value = getattr(state.regs, reg_name)
+            state.solver.add(claripy.Or(value < low, value > high))
 
     @classmethod
     def reaching_state(cls, project, target_addr, start_addr=None, step_limit=None):
