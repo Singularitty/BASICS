@@ -6,7 +6,9 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 REPORTS_DIR = ROOT / "reports"
 DEFAULT_MANIFEST = ROOT / "Benchmarks" / "stack_benchmark" / "stack_cases_combined.json"
 RESULTS_DIR = ROOT / "Benchmarks" / "stack_benchmark" / "results"
+ACTIVE_PROCS = set()
+ACTIVE_PROCS_LOCK = threading.Lock()
 BO_CWE_IDS = {
     # BO-only scoring for BASICS-vs-external comparisons. Exclude underflow
     # classes such as CWE-124 so no_underflow_* properties do not count as
@@ -204,6 +208,8 @@ def run_interruptible(cmd: list[str], timeout_sec: int | None):
         text=True,
         start_new_session=True,
     )
+    with ACTIVE_PROCS_LOCK:
+        ACTIVE_PROCS.add(proc)
     try:
         output, _ = proc.communicate(timeout=timeout_sec)
         return proc.returncode, output or "", None
@@ -215,6 +221,9 @@ def run_interruptible(cmd: list[str], timeout_sec: int | None):
         terminate_process_group(proc)
         output, _ = proc.communicate(timeout=5)
         return proc.returncode, output or "", "timeout"
+    finally:
+        with ACTIVE_PROCS_LOCK:
+            ACTIVE_PROCS.discard(proc)
 
 
 def terminate_process_group(proc):
@@ -240,6 +249,14 @@ def terminate_process_group(proc):
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+
+def terminate_active_processes():
+    with ACTIVE_PROCS_LOCK:
+        procs = list(ACTIVE_PROCS)
+    for proc in procs:
+        if proc.poll() is None:
+            terminate_process_group(proc)
 
 
 def run_case(case, basics_args: list[str], out_logs_dir: Path, timeout_sec: int | None):
@@ -329,7 +346,37 @@ def run_case(case, basics_args: list[str], out_logs_dir: Path, timeout_sec: int 
     return row
 
 
-def write_results(out_dir: Path, rows):
+def slugify(value: str, fallback: str = "run") -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+    return slug or fallback
+
+
+def infer_dataset_name(cases, manifest: Path, override: str | None = None) -> str:
+    if override:
+        return slugify(override, "dataset")
+    datasets = sorted({str(c.get("dataset", "")).strip() for c in cases if c.get("dataset")})
+    if len(datasets) == 1:
+        return slugify(datasets[0], "dataset")
+    manifest_name = manifest.stem.lower()
+    if "juliet" in manifest_name:
+        return "juliet"
+    if "sard" in manifest_name or "stack_cases" in manifest_name:
+        return "sard"
+    return "mixed"
+
+
+def unique_run_dir(stem: str) -> Path:
+    candidate = RESULTS_DIR / stem
+    if not candidate.exists():
+        return candidate
+    for idx in range(2, 1000):
+        candidate = RESULTS_DIR / f"{stem}_{idx:02d}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not allocate unique result directory for {stem}")
+
+
+def write_results(out_dir: Path, rows, run_stem: str | None = None):
     csv_path = out_dir / "results.csv"
     json_path = out_dir / "results.json"
 
@@ -357,12 +404,105 @@ def write_results(out_dir: Path, rows):
         "report_path",
         "manifest_path",
     ]
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    json_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
-    return csv_path, json_path
+    csv_paths = [csv_path]
+    json_paths = [json_path]
+    if run_stem:
+        csv_paths.append(out_dir / f"{run_stem}_results.csv")
+        json_paths.append(out_dir / f"{run_stem}_results.json")
+
+    for path in csv_paths:
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+    json_payload = json.dumps(rows, indent=2)
+    for path in json_paths:
+        path.write_text(json_payload, encoding="utf-8")
+    return csv_path, json_path, csv_paths, json_paths
+
+
+def write_stats(out_dir: Path, csv_path: Path, run_stem: str | None = None):
+    stats_txt_path = out_dir / "stats.txt"
+    stats_json_path = out_dir / "stats.json"
+
+    txt_proc = subprocess.run(
+        ["python3", "scripts/calc_metrics.py", str(csv_path), "--by-dataset"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    stats_txt_path.write_text(txt_proc.stdout, encoding="utf-8")
+
+    json_proc = subprocess.run(
+        ["python3", "scripts/calc_metrics.py", str(csv_path), "--by-dataset", "--json"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    stats_json_path.write_text(json_proc.stdout, encoding="utf-8")
+
+    txt_paths = [stats_txt_path]
+    json_paths = [stats_json_path]
+    if run_stem:
+        named_txt = out_dir / f"{run_stem}_stats.txt"
+        named_json = out_dir / f"{run_stem}_stats.json"
+        named_txt.write_text(stats_txt_path.read_text(encoding="utf-8"), encoding="utf-8")
+        named_json.write_text(stats_json_path.read_text(encoding="utf-8"), encoding="utf-8")
+        txt_paths.append(named_txt)
+        json_paths.append(named_json)
+    return txt_paths, json_paths, txt_proc.returncode, json_proc.returncode
+
+
+def read_meminfo_mb() -> tuple[int | None, int | None]:
+    values = {}
+    try:
+        with Path("/proc/meminfo").open(encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    values[parts[0].rstrip(":")] = int(parts[1]) // 1024
+    except OSError:
+        return None, None
+    return values.get("MemTotal"), values.get("MemAvailable")
+
+
+def default_reserve_memory_mb(total_mb: int | None) -> int:
+    if total_mb is None:
+        return 2048
+    return max(2048, int(total_mb * 0.10))
+
+
+def auto_worker_count(
+    requested: str,
+    case_count: int,
+    memory_limit_mb: int | None,
+    mem_per_worker_mb: int | None,
+    reserve_memory_mb: int | None,
+) -> tuple[int, str]:
+    if case_count <= 0:
+        return 1, "no cases"
+    cpu_count = os.cpu_count() or 1
+    if requested != "auto":
+        workers = int(requested)
+        if workers < 1:
+            raise SystemExit("--jobs must be 'auto' or a positive integer")
+        return min(workers, case_count), f"requested={workers}"
+
+    total_mb, available_mb = read_meminfo_mb()
+    reserve_mb = reserve_memory_mb if reserve_memory_mb is not None else default_reserve_memory_mb(total_mb)
+    per_worker_mb = mem_per_worker_mb or memory_limit_mb or int(os.environ.get("BASICS_BENCH_MB_PER_WORKER", "2500"))
+    memory_budget_mb = max(0, (available_mb or total_mb or per_worker_mb) - reserve_mb)
+    memory_workers = max(1, memory_budget_mb // max(1, per_worker_mb))
+    workers = max(1, min(case_count, cpu_count, memory_workers))
+    reason = (
+        f"auto: cpus={cpu_count}, mem_available_mb={available_mb or 'unknown'}, "
+        f"reserve_mb={reserve_mb}, per_worker_mb={per_worker_mb}"
+    )
+    return workers, reason
 
 
 def main():
@@ -377,6 +517,29 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Run at most N cases after filtering.")
     parser.add_argument("--no-patching", action="store_true", help="Run BASICS with --no-patching.")
     parser.add_argument("--timeout-sec", type=int, default=None, help="Per-case timeout for BASICS execution.")
+    parser.add_argument(
+        "--jobs",
+        default="1",
+        help="Number of benchmark cases to run concurrently, or 'auto'. Default: 1.",
+    )
+    parser.add_argument(
+        "--mem-per-worker-mb",
+        type=int,
+        default=None,
+        help="Memory estimate used by --jobs auto. Defaults to --memory-limit-mb or 2500 MB.",
+    )
+    parser.add_argument(
+        "--reserve-memory-mb",
+        type=int,
+        default=None,
+        help="Memory kept free by --jobs auto. Defaults to max(2048 MB, 10%% of RAM).",
+    )
+    parser.add_argument("--tool-name", default="basics",
+                        help="Tool component used in result directory/file names.")
+    parser.add_argument("--run-dataset-name", default=None,
+                        help="Dataset component used in result directory/file names.")
+    parser.add_argument("--no-stats", action="store_true",
+                        help="Do not write stats.txt/stats.json alongside results.")
     parser.add_argument("--cfg-mode", choices=["auto", "emulated", "fast"], default="auto")
     parser.add_argument("--function-simulation", choices=["auto", "static", "angr"], default="static")
     parser.add_argument("--patched-function-simulation", choices=["auto", "static", "angr"], default="static")
@@ -407,8 +570,12 @@ def main():
     if args.limit is not None:
         cases = cases[: args.limit]
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    out_dir = RESULTS_DIR / timestamp
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    tool_name = slugify(args.tool_name, "tool")
+    dataset_name = infer_dataset_name(cases, args.manifest, args.run_dataset_name)
+    run_stem = f"{tool_name}_{dataset_name}_{timestamp}"
+    out_dir = unique_run_dir(run_stem)
+    run_stem = out_dir.name
     logs_dir = out_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -433,23 +600,80 @@ def main():
     if args.strict_stderr_validation:
         basics_args.append("--strict-stderr-validation")
 
-    rows = []
+    jobs, jobs_reason = auto_worker_count(
+        args.jobs,
+        len(cases),
+        args.memory_limit_mb,
+        args.mem_per_worker_mb,
+        args.reserve_memory_mb,
+    )
+    print(f"Running {len(cases)} case(s) with {jobs} worker(s) ({jobs_reason}).", flush=True)
+
+    rows = [None] * len(cases)
     interrupted = False
-    for case in cases:
-        result = run_case(case, basics_args, logs_dir, args.timeout_sec)
-        if isinstance(result, tuple):
-            row, interrupted = result
-        else:
-            row = result
-        rows.append(row)
-        print(f"[{len(rows)}/{len(cases)}] {case['case_id']}: {row['status']} reported={row['reported_vuln']} patched={row['patched']} validated={row['patch_validated']}")
-        if interrupted:
-            print("Interrupted. Wrote partial results and stopped.")
-            break
+    completed = 0
+    if jobs == 1:
+        for idx, case in enumerate(cases):
+            result = run_case(case, basics_args, logs_dir, args.timeout_sec)
+            if isinstance(result, tuple):
+                row, interrupted = result
+            else:
+                row = result
+            rows[idx] = row
+            completed += 1
+            print(f"[{completed}/{len(cases)}] {case['case_id']}: {row['status']} reported={row['reported_vuln']} patched={row['patched']} validated={row['patch_validated']}", flush=True)
+            if interrupted:
+                print("Interrupted. Wrote partial results and stopped.", flush=True)
+                break
+    else:
+        executor = ThreadPoolExecutor(max_workers=jobs)
+        try:
+            future_to_case = {
+                executor.submit(run_case, case, basics_args, logs_dir, args.timeout_sec): (idx, case)
+                for idx, case in enumerate(cases)
+            }
+            for future in as_completed(future_to_case):
+                idx, case = future_to_case[future]
+                result = future.result()
+                if isinstance(result, tuple):
+                    row, interrupted = result
+                else:
+                    row = result
+                rows[idx] = row
+                completed += 1
+                print(f"[{completed}/{len(cases)}] {case['case_id']}: {row['status']} reported={row['reported_vuln']} patched={row['patched']} validated={row['patch_validated']}", flush=True)
+                if interrupted:
+                    print("Interrupted. Wrote partial results and stopped.", flush=True)
+                    terminate_active_processes()
+                    break
+        except KeyboardInterrupt:
+            interrupted = True
+            terminate_active_processes()
+            print("Interrupted. Wrote partial results and stopped.", flush=True)
+        finally:
+            executor.shutdown(wait=not interrupted, cancel_futures=interrupted)
 
-    csv_path, json_path = write_results(out_dir, rows)
+    completed_rows = [row for row in rows if row is not None]
+    csv_path, json_path, csv_paths, json_paths = write_results(out_dir, completed_rows, run_stem)
 
-    print(f"Wrote benchmark results:\n  CSV: {csv_path}\n  JSON: {json_path}")
+    print("Wrote benchmark results:")
+    print(f"  Directory: {out_dir}")
+    print(f"  CSV: {csv_path}")
+    print(f"  JSON: {json_path}")
+    if len(csv_paths) > 1:
+        print(f"  Named CSV: {csv_paths[-1]}")
+        print(f"  Named JSON: {json_paths[-1]}")
+
+    if not args.no_stats:
+        txt_paths, stats_json_paths, txt_rc, json_rc = write_stats(out_dir, csv_path, run_stem)
+        print("Wrote benchmark statistics:")
+        print(f"  Stats text: {txt_paths[0]}")
+        print(f"  Stats JSON: {stats_json_paths[0]}")
+        if len(txt_paths) > 1:
+            print(f"  Named stats text: {txt_paths[-1]}")
+            print(f"  Named stats JSON: {stats_json_paths[-1]}")
+        if txt_rc != 0 or json_rc != 0:
+            print("Warning: metrics generation reported an error; see stats files for details.")
 
 
 if __name__ == "__main__":
