@@ -155,6 +155,7 @@ def build_cases(cwe_dir: Path) -> list[dict]:
             {
                 **common,
                 "case_id": f"juliet_{safe_stem}_bad_only",
+                "analysis_entry": f"{safe_stem}_bad",
                 "binary_path": str(bad_bin.relative_to(ROOT)),
                 "analysis_source_path": str(bad_source.relative_to(ROOT)),
                 "true_present_vuln": True,
@@ -166,6 +167,7 @@ def build_cases(cwe_dir: Path) -> list[dict]:
             {
                 **common,
                 "case_id": f"juliet_{safe_stem}_good_only",
+                "analysis_entry": f"{safe_stem}_good",
                 "binary_path": str(good_bin.relative_to(ROOT)),
                 "analysis_source_path": str(good_source.relative_to(ROOT)),
                 "true_present_vuln": False,
@@ -187,7 +189,10 @@ def main():
     obj = {
         "meta": {
             "generated_by": "scripts/prepare_juliet_cwe121_isolated_manifest.py",
-            "note": "Fair whole-binary Juliet CWE-121 manifest: bad-only/good-only binaries.",
+            "note": (
+                "Fair isolated Juliet CWE-121 binaries. BASICS starts at the "
+                "labelled bad/good function; whole-binary tools may ignore analysis_entry."
+            ),
         },
         "cases": cases,
         "summary": {

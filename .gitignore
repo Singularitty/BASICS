@@ -1,5 +1,6 @@
 # Large/generated benchmark inputs and outputs.
 Benchmarks/
+benchmark-data/
 
 # BASICS generated reports and ad-hoc benchmark outputs. Tracked files remain
 # tracked, but new generated reports should not pollute git status.
@@ -143,6 +144,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv-*/
 env/
 venv/
 ENV/

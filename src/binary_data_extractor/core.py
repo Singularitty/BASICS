@@ -38,7 +38,7 @@ class BinaryDataExtractor:
         self.binary = os.path.realpath(os.path.abspath(binary_path))
         self.fingerprint = self.__fingerprint(self.binary)
         try:
-            self.project = angr.Project(self.binary, load_options={'auto_load_libs': False}, exclude_sim_procedures_list=["free", "printf", "puts", "strlen",  "printf", "fprintf",
+            self.project = angr.Project(self.binary, load_options={'auto_load_libs': False}, exclude_sim_procedures_list=["free", "printf", "puts", "printf", "fprintf",
                                                                                                                             "fopen", "fclose", "fscanf", "strcmp", "system", "fread",
                                                                                                                             "exit", "time", "error", "perror", "fwrite", "printf_unlocked",
                                                                                                                             "puts_unlocked", "putchar_unlocked", "fputs_unlocked", "fputc_unlocked",
@@ -176,9 +176,38 @@ class BinaryDataExtractor:
 
     def find_loops(self):
         """
-        Finds loops in the CFG
+        Finds loops reachable from the selected analysis entry.
+
+        Running LoopFinder over every recovered function also analyzes Juliet's
+        linked testcase-support/thread helpers, even though they are unreachable
+        from the selected good/bad entry.  Several of those functions make
+        LoopFinder consume minutes and gigabytes before MSS construction starts.
         """
-        loops = self.project.analyses.LoopFinder()
+        callgraph = self.cfg.kb.callgraph
+        try:
+            entry_function = self.cfg.kb.functions.floor_func(self.analysis_entry_addr)
+        except Exception:
+            entry_function = None
+        if entry_function is None:
+            functions = self.functions
+        else:
+            reachable = {entry_function.addr}
+            pending = [entry_function.addr]
+            while pending:
+                address = pending.pop()
+                if address not in callgraph:
+                    continue
+                for successor in callgraph.successors(address):
+                    if successor not in reachable:
+                        reachable.add(successor)
+                        pending.append(successor)
+            functions = [
+                self.cfg.kb.functions[address]
+                for address in reachable
+                if address in self.cfg.kb.functions
+                and self.__is_user_function(self.cfg.kb.functions[address])
+            ]
+        loops = self.project.analyses.LoopFinder(functions=functions)
         return loops.loops
 
     def extract_user_functions(self):

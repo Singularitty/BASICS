@@ -211,6 +211,11 @@ class LinearTemporalLogicTranslator:
     def ltl2ba(self):
         buchi_dir = os.path.join(self.directory, "buchi_automata")
         os.makedirs(buchi_dir, exist_ok=True)
+        # With --no-recompilation-ltl, find_formulas() loads the checked-in
+        # automata.  No external translator is required when every formula is
+        # already cached.
+        if not self.parsed_formulas:
+            return
         if global_vars.LTL_BACKEND in ("spot", "auto"):
             try:
                 self.__compile_with_spot(buchi_dir)
