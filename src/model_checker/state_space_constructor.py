@@ -1,6 +1,8 @@
 import angr
 import claripy
 import os
+from elftools.elf.elffile import ELFFile
+from elftools.dwarf.dwarf_expr import DWARFExprParser
 
 import src.global_vars as global_vars
 from src.global_vars import CLIB_FUNCTIONS, GLOBAL_HOOKS, NO_EXECUTE_FUNCTIONS
@@ -23,6 +25,24 @@ _NO_STACK_EFFECT_USER_HELPERS = {
     "printLine",
     "printIntLine",
 }
+
+
+class _ConcreteWcslen(angr.SimProcedure):
+    """Model glibc's four-byte ``wchar_t`` strings used by Juliet.
+
+    angr does not currently ship a wcslen SimProcedure.  Returning an
+    unconstrained value here makes Juliet's variable-length alloca symbolic,
+    which in turn explodes even for the labelled non-vulnerable cases.
+    """
+
+    def run(self, string):
+        for index in range(4096):
+            wchar = self.state.memory.load(string + index * 4, 4, endness="Iend_LE")
+            if self.state.solver.is_true(wchar == 0):
+                return index
+            if self.state.solver.symbolic(wchar):
+                break
+        return self.state.solver.Unconstrained("wcslen", self.state.arch.bits)
 
 def _clib_name_for_plt(plt_name, clib_names):
     """Return the matching clib name for a PLT symbol, handling glibc versioned prefixes."""
@@ -50,6 +70,8 @@ class StateSpaceConstructor:
         self.binary_path = binary_path
         self.max_states = max_states
         self.max_recursion_depth = max_recursion_depth
+        self._dwarf_buffers = self.__load_dwarf_stack_buffers()
+        self._dwarf_runtime_bias = {}
         self._hook_all_clib_plt()
         # Block-address → function-entry-address map, used to check whether a
         # fall-through address belongs to the same function as its predecessor.
@@ -60,6 +82,8 @@ class StateSpaceConstructor:
                     self._block_func_map[ba] = func.addr
             except Exception:
                 pass
+        self._dynamic_write_allocations = {}
+        self._inlined_alloca_overflow_writes = self.__find_inlined_alloca_overflow_writes()
 
     @staticmethod
     def hook_clib_plt(project):
@@ -69,7 +93,22 @@ class StateSpaceConstructor:
         plt = project.loader.main_object.plt
         ret_unc = angr.SIM_PROCEDURES["stubs"]["ReturnUnconstrained"]
         for name, addr in plt.items():
-            if _clib_name_for_plt(name, clib_names) and not project.is_hooked(addr):
+            clib_name = _clib_name_for_plt(name, clib_names)
+            if not clib_name or project.is_hooked(addr):
+                continue
+            # Loop bounds in Juliet frequently depend on strlen after memset.
+            # ReturnUnconstrained turns those deterministic bounds symbolic and
+            # causes exponential loop exploration.  Preserve the concrete
+            # memory/length semantics needed to reach loop exits.
+            if clib_name in {"strlen", "memset", "wcslen"}:
+                if clib_name == "wcslen":
+                    project.hook(addr, _ConcreteWcslen())
+                    continue
+                procedure = angr.SIM_PROCEDURES["libc"].get(clib_name)
+                if procedure is not None:
+                    project.hook(addr, procedure())
+                    continue
+            if not project.is_hooked(addr):
                 project.hook(addr, ret_unc())
                 GLOBAL_HOOKS.add(addr)
 
@@ -163,6 +202,7 @@ class StateSpaceConstructor:
             if not current_state.contains_stack_frame(function_name):
                 new_stack_frame = StackFrame()
                 new_stack_frame.initialize()
+                self.__apply_dwarf_buffers(new_stack_frame, function_name)
                 current_state = current_state.add_stack_frame(function_name, new_stack_frame)
                 self.state_space.add_state(current_state)
             for ins in node.block.capstone.insns:
@@ -195,22 +235,29 @@ class StateSpaceConstructor:
             if not global_vars.SCAN_MODE:
                 print("Loop has no stack-buffer writes. Skipping loop emulation.")
             return current_state
+        if global_vars.LOOP_SIMULATION == "static":
+            difs = self.__static_loop_stack_write_indices(loop, current_state, fname, node)
+            return self.__apply_loop_stack_writes(node, current_state, fname, difs)
         try:
             fname, difs = self.__loop_emulator(node, current_state)
-        except FailedConcolicExecution:
-            print(f"Failed to execute loop.")
+        except FailedConcolicExecution as exc:
+            print(f"Failed to execute loop: {exc}" if global_vars.DEBUG else "Failed to execute loop.")
             print("Retrying without function hooks...")
             for addr in GLOBAL_HOOKS:
                 self.project.unhook(addr)
             try:
                 fname, difs = self.__loop_emulator(node, current_state)
                 print("Loop emulation successful.")
-            except FailedConcolicExecution:
-                print("Failed to execute loop. Skipping loop emulation.")
-                difs = self.__static_loop_stack_write_indices(loop, current_state, fname, node)
+            except FailedConcolicExecution as exc:
+                print(
+                    f"Failed to execute loop: {exc}. Skipping loop emulation."
+                    if global_vars.DEBUG else
+                    "Failed to execute loop. Skipping loop emulation."
+                )
+                difs = self.__loop_fallback_indices(loop, current_state, fname, node)
             except FailedLoopUnrolling:
                 print("Failed to unroll loop. Skipping loop emulation.")
-                difs = self.__static_loop_stack_write_indices(loop, current_state, fname, node)
+                difs = self.__loop_fallback_indices(loop, current_state, fname, node)
             finally:
                 ret_unc = angr.SIM_PROCEDURES["stubs"]["ReturnUnconstrained"]
                 for addr in GLOBAL_HOOKS:
@@ -218,11 +265,21 @@ class StateSpaceConstructor:
                         self.project.hook(addr, ret_unc())
         except FailedLoopUnrolling:
             print("Failed to unroll loop. Skipping loop emulation.")
-            difs = self.__static_loop_stack_write_indices(loop, current_state, fname, node)
+            difs = self.__loop_fallback_indices(loop, current_state, fname, node)
+        return self.__apply_loop_stack_writes(node, current_state, fname, difs)
+
+    def __loop_fallback_indices(self, loop, current_state, function_name, loop_node):
+        if global_vars.LOOP_SIMULATION != "concolic-static":
+            return []
+        return self.__static_loop_stack_write_indices(
+            loop, current_state, function_name, loop_node
+        )
+
+    def __apply_loop_stack_writes(self, node, current_state, function_name, difs):
         if len(difs) > 0:
-            old_frame = current_state.get_stack_frame(fname)
+            old_frame = current_state.get_stack_frame(function_name)
             new_frame = old_frame.write_multiple_bytes(difs)
-            next_state = current_state.add_stack_frame(fname, new_frame)
+            next_state = current_state.add_stack_frame(function_name, new_frame)
             jump_ins = self.__get_any_node(node.addr).block.capstone.insns[-1]
             next_state = next_state.add_instruction(jump_ins)
             self.state_space.add_state(next_state)
@@ -321,6 +378,14 @@ class StateSpaceConstructor:
         aliases = {
             "esp": "rsp", "sp": "rsp", "spl": "rsp",
             "ebp": "rbp", "bp": "rbp", "bpl": "rbp",
+            "eax": "rax", "ax": "rax", "al": "rax",
+            "ebx": "rbx", "bx": "rbx", "bl": "rbx",
+            "ecx": "rcx", "cx": "rcx", "cl": "rcx",
+            "edx": "rdx", "dx": "rdx", "dl": "rdx",
+            "esi": "rsi", "si": "rsi", "sil": "rsi",
+            "edi": "rdi", "di": "rdi", "dil": "rdi",
+            "r8d": "r8", "r8w": "r8", "r8b": "r8",
+            "r9d": "r9", "r9w": "r9", "r9b": "r9",
         }
         return aliases.get(name, name)
 
@@ -351,6 +416,15 @@ class StateSpaceConstructor:
         local_constants = local_constants or {}
         register_constants = register_constants or {}
         register_bounds = register_bounds or {}
+        if ins.address in self._inlined_alloca_overflow_writes:
+            frame = current_state.get_stack_frame(function_name)
+            next_state = current_state.add_stack_frame(
+                function_name, frame.write_multiple_bytes(range(frame.get_stack_size()))
+            )
+            next_state = next_state.add_instruction(ins)
+            self.state_space.add_state(next_state)
+            self.state_space.add_transition(current_state, next_state, MemoryTransition(ins, self.cfg))
+            return next_state
         transition = MemoryTransition(ins, self.cfg)
         if transition.type is not None:
             next_state = None
@@ -396,6 +470,7 @@ class StateSpaceConstructor:
                     address = transition.type.offset
                     new_frame = current_state.get_stack_frame(function_name)
                     new_frame.map_buffer(address)
+                    self.__apply_dwarf_buffers(new_frame, function_name)
                     next_state = current_state.add_stack_frame(function_name, new_frame)
                     next_state = next_state.add_instruction(ins)
                 case OperationType.INDIRECT:
@@ -430,7 +505,10 @@ class StateSpaceConstructor:
                             next_state = current_state.add_stack_frame(function_name, new_frame)
                             next_state = next_state.add_instruction(ins)
                     elif any(x.name == call_name for x in self.user_functions) and not current_state.contains_stack_frame(call_name):
-                        current_state = self.__summarize_user_call(ins, function_name, node, current_state)
+                        if global_vars.USER_CALL_SIMULATION == "concolic":
+                            current_state = self.__summarize_user_call(
+                                ins, function_name, node, current_state
+                            )
                         new_frame = StackFrame()
                         new_frame.initialize()
                         next_state = current_state.add_stack_frame(call_name, new_frame)
@@ -450,6 +528,234 @@ class StateSpaceConstructor:
             self.state_space.add_transition(current_state, next_state, transition)
             return next_state
         return current_state
+
+    def __apply_dwarf_buffers(self, frame, function_name):
+        for offset, size in self._dwarf_buffers.get(function_name, ()):
+            frame.buffer_map[abs(int(offset))] = int(size)
+
+    def __load_dwarf_stack_buffers(self):
+        """Recover fixed local-array boundaries from the benchmark's DWARF."""
+        buffers = {}
+        try:
+            with open(self.binary_path, "rb") as stream:
+                elf = ELFFile(stream)
+                if not elf.has_dwarf_info():
+                    return buffers
+                dwarf = elf.get_dwarf_info()
+                parser = DWARFExprParser(dwarf.structs)
+                for cu in dwarf.iter_CUs():
+                    for die in cu.iter_DIEs():
+                        if die.tag != "DW_TAG_subprogram":
+                            continue
+                        name_attr = die.attributes.get("DW_AT_name")
+                        if name_attr is None:
+                            continue
+                        name = name_attr.value.decode(errors="replace") if isinstance(name_attr.value, bytes) else str(name_attr.value)
+                        recovered = []
+                        for child in die.iter_children():
+                            self.__collect_dwarf_array_variables(child, cu, parser, recovered)
+                        if recovered:
+                            buffers[name] = recovered
+        except Exception as exc:
+            if global_vars.DEBUG:
+                print(f"Could not read DWARF stack buffers: {exc}")
+        return buffers
+
+    def __collect_dwarf_array_variables(self, die, cu, parser, recovered):
+        if die.tag == "DW_TAG_variable":
+            location = die.attributes.get("DW_AT_location")
+            type_attr = die.attributes.get("DW_AT_type")
+            if location is not None and type_attr is not None:
+                try:
+                    operations = parser.parse_expr(bytes(location.value))
+                    if operations and operations[0].op_name == "DW_OP_fbreg":
+                        type_die = die.get_DIE_from_attribute("DW_AT_type")
+                        size = self.__dwarf_array_size(type_die, cu)
+                        if size:
+                            # On x86-64 with a frame pointer, CFA is rbp+16.
+                            recovered.append((int(operations[0].args[0]) + 16, int(size)))
+                except Exception:
+                    pass
+        for child in die.iter_children():
+            self.__collect_dwarf_array_variables(child, cu, parser, recovered)
+
+    def __dwarf_array_size(self, die, cu):
+        visited = set()
+        while die is not None and die.offset not in visited:
+            visited.add(die.offset)
+            if die.tag == "DW_TAG_array_type":
+                size_attr = die.attributes.get("DW_AT_byte_size")
+                if size_attr is not None:
+                    return int(size_attr.value)
+                type_attr = die.attributes.get("DW_AT_type")
+                element = die.get_DIE_from_attribute("DW_AT_type") if type_attr else None
+                element_size = self.__dwarf_type_size(element, cu)
+                count = 1
+                for child in die.iter_children():
+                    if child.tag != "DW_TAG_subrange_type":
+                        continue
+                    count_attr = child.attributes.get("DW_AT_count")
+                    upper_attr = child.attributes.get("DW_AT_upper_bound")
+                    count *= int(count_attr.value) if count_attr else int(upper_attr.value) + 1 if upper_attr else 1
+                return element_size * count if element_size else None
+            type_attr = die.attributes.get("DW_AT_type")
+            if type_attr is None:
+                return None
+            die = die.get_DIE_from_attribute("DW_AT_type")
+        return None
+
+    def __dwarf_type_size(self, die, cu):
+        visited = set()
+        while die is not None and die.offset not in visited:
+            visited.add(die.offset)
+            size_attr = die.attributes.get("DW_AT_byte_size")
+            if size_attr is not None:
+                return int(size_attr.value)
+            type_attr = die.attributes.get("DW_AT_type")
+            if type_attr is None:
+                return None
+            die = die.get_DIE_from_attribute("DW_AT_type")
+        return None
+
+    def __find_inlined_alloca_overflow_writes(self):
+        """Find constant indirect writes beyond a recovered dynamic alloca.
+
+        GCC expands fixed-size memcpy/memmove calls into register-indirect movs
+        even at -O0.  MemoryTransition intentionally ignores arbitrary [reg]
+        writes, so the entire Juliet alloca-copy family otherwise disappears.
+        This small forward analysis follows constant allocation sizes and
+        pointer spills within each recovered function.
+        """
+        overflow_writes = set()
+        for func in self.cfg.kb.functions.values():
+            constants = {}
+            aliases = {}
+            local_aliases = {}
+            current_alloc_size = None
+            instructions = []
+            for addr in sorted(getattr(func, "block_addrs", ())):
+                try:
+                    instructions.extend(self.project.factory.block(addr).capstone.insns)
+                except Exception:
+                    continue
+            seen = set()
+            for ins in instructions:
+                if ins.address in seen:
+                    continue
+                seen.add(ins.address)
+                ops = ins.operands
+                if not ops:
+                    continue
+
+                # Flag writes through a pointer known to refer to the latest
+                # dynamic allocation.  Constant displacements are sufficient
+                # for GCC's unrolled memcpy/memmove expansion.
+                dst = ops[0]
+                if dst.type == X86_OP_MEM:
+                    mem = dst.value.mem
+                    base = self.__canonical_ins_register(ins, mem.base)
+                    alias = aliases.get(base)
+                    if alias is not None:
+                        self._dynamic_write_allocations[ins.address] = int(alias[0])
+                    if alias is not None and mem.index == 0:
+                        alloc_size, base_offset = alias
+                        end = base_offset + int(mem.disp or 0) + int(getattr(dst, "size", 0) or 0)
+                        if alloc_size > 0 and end > alloc_size:
+                            if global_vars.DEBUG:
+                                print(
+                                    f"Inlined alloca overflow candidate in {func.name} at {hex(ins.address)}: "
+                                    f"write_end={end}, allocation={alloc_size}"
+                                )
+                            overflow_writes.add(ins.address)
+
+                if ins.mnemonic in ("div", "idiv") and len(ops) == 1 and ops[0].type == X86_OP_REG:
+                    divisor = constants.get(self.__canonical_ins_register(ins, ops[0].reg))
+                    dividend = constants.get("rax")
+                    if divisor not in (None, 0) and dividend is not None:
+                        constants["rax"], constants["rdx"] = divmod(dividend, divisor)
+                    else:
+                        constants.pop("rax", None)
+                        constants.pop("rdx", None)
+                    continue
+                if len(ops) < 2:
+                    continue
+                src = ops[1]
+                if dst.type == X86_OP_REG:
+                    dst_reg = self.__canonical_ins_register(ins, dst.reg)
+                    if ins.mnemonic == "lea" and src.type == X86_OP_MEM:
+                        mem = src.value.mem
+                        base = self.__canonical_ins_register(ins, mem.base)
+                        index = self.__canonical_ins_register(ins, mem.index)
+                        source_alias = aliases.get(base) or aliases.get(index)
+                        if source_alias is not None:
+                            size, offset = source_alias
+                            aliases[dst_reg] = (size, offset + int(mem.disp or 0))
+                        else:
+                            aliases.pop(dst_reg, None)
+                        constants.pop(dst_reg, None)
+                    elif ins.mnemonic in ("mov", "movabs", "movsxd"):
+                        if src.type == X86_OP_IMM:
+                            constants[dst_reg] = int(src.imm)
+                            aliases.pop(dst_reg, None)
+                        elif src.type == X86_OP_REG:
+                            src_reg = self.__canonical_ins_register(ins, src.reg)
+                            if src_reg in constants:
+                                constants[dst_reg] = constants[src_reg]
+                            else:
+                                constants.pop(dst_reg, None)
+                            if src_reg == "rsp" and current_alloc_size is not None:
+                                aliases[dst_reg] = (current_alloc_size, 0)
+                            elif src_reg in aliases:
+                                aliases[dst_reg] = aliases[src_reg]
+                            else:
+                                aliases.pop(dst_reg, None)
+                        elif src.type == X86_OP_MEM:
+                            mem = src.value.mem
+                            if self.__canonical_ins_register(ins, mem.base) == "rbp" and mem.index == 0:
+                                alias = local_aliases.get(int(mem.disp))
+                                if alias is not None:
+                                    aliases[dst_reg] = alias
+                                else:
+                                    aliases.pop(dst_reg, None)
+                            else:
+                                aliases.pop(dst_reg, None)
+                            constants.pop(dst_reg, None)
+                    elif ins.mnemonic in ("add", "sub") and src.type == X86_OP_IMM:
+                        delta = int(src.imm) * (1 if ins.mnemonic == "add" else -1)
+                        if dst_reg in constants:
+                            constants[dst_reg] += delta
+                        if dst_reg in aliases:
+                            size, offset = aliases[dst_reg]
+                            aliases[dst_reg] = (size, offset + delta)
+                    elif ins.mnemonic == "add" and src.type == X86_OP_REG:
+                        src_reg = self.__canonical_ins_register(ins, src.reg)
+                        if dst_reg not in aliases and src_reg in aliases:
+                            aliases[dst_reg] = aliases[src_reg]
+                        constants.pop(dst_reg, None)
+                    elif ins.mnemonic == "and" and src.type == X86_OP_IMM and dst_reg in constants:
+                        constants[dst_reg] &= int(src.imm)
+                    elif ins.mnemonic in ("shr", "shl") and src.type == X86_OP_IMM:
+                        if dst_reg in constants:
+                            shift = int(src.imm)
+                            constants[dst_reg] = constants[dst_reg] >> shift if ins.mnemonic == "shr" else constants[dst_reg] << shift
+                        if dst_reg in aliases:
+                            size, _ = aliases[dst_reg]
+                            aliases[dst_reg] = (size, 0)
+                    elif ins.mnemonic == "imul" and len(ops) == 3 and ops[1].type == X86_OP_REG and ops[2].type == X86_OP_IMM:
+                        source = constants.get(self.__canonical_ins_register(ins, ops[1].reg))
+                        if source is not None:
+                            constants[dst_reg] = source * int(ops[2].imm)
+                    elif ins.mnemonic == "sub" and dst_reg == "rsp":
+                        size = constants.get(self.__canonical_ins_register(ins, src.reg)) if src.type == X86_OP_REG else int(src.imm) if src.type == X86_OP_IMM else None
+                        if size is not None and 0 < size < 0x1000:
+                            current_alloc_size = size
+                elif dst.type == X86_OP_MEM and src.type == X86_OP_REG:
+                    mem = dst.value.mem
+                    if self.__canonical_ins_register(ins, mem.base) == "rbp" and mem.index == 0:
+                        src_reg = self.__canonical_ins_register(ins, src.reg)
+                        if src_reg in aliases:
+                            local_aliases[int(mem.disp)] = aliases[src_reg]
+        return overflow_writes
 
     def __indexed_write_frame(self, frame, write_op, register_constants, register_bounds):
         index_value = register_constants.get(write_op.index_register)
@@ -776,14 +1082,34 @@ class StateSpaceConstructor:
         # _good()) that calls several sub-functions, using the global entry forces
         # angr to navigate the full call chain on every reaching_state call,
         # multiplying cost by the number of sub-functions.
-        pre_loop_state = ConcolicExecutor.reaching_state(self.project, loop_entry, start_addr=entry_addr)
+        loop_project = self.project
+        pre_loop_state = ConcolicExecutor.reaching_state(loop_project, loop_entry, start_addr=entry_addr)
         stack_pointer = pre_loop_state.regs.rsp
+        concrete_sp = pre_loop_state.solver.eval(stack_pointer)
+        observed_writes_by_instruction = {}
+
+        def record_stack_write(write_state):
+            try:
+                address = write_state.solver.eval(write_state.inspect.mem_write_address)
+                length_expr = write_state.inspect.mem_write_length
+                length = write_state.solver.eval(length_expr) if length_expr is not None else 1
+            except Exception:
+                return
+            instruction_writes = observed_writes_by_instruction.setdefault(write_state.addr, set())
+            for byte_address in range(address, address + max(1, int(length))):
+                instruction_writes.add(byte_address)
+
+        pre_loop_state.inspect.b(
+            "mem_write",
+            when=angr.BP_BEFORE,
+            action=record_stack_write,
+        )
 
         stack_memory_before = pre_loop_state.solver.eval(pre_loop_state.memory.load(stack_pointer, current_stack_frame.get_stack_size()), cast_to=bytes)
 
         iteration_count = 0
 
-        simgr = self.project.factory.simgr(pre_loop_state)
+        simgr = loop_project.factory.simgr(pre_loop_state)
 
         while iteration_count < self.max_iter:
             simgr.step()
@@ -794,7 +1120,7 @@ class StateSpaceConstructor:
             # Prune states to prevent exponential explosion when loop body
             # contains branches over unconstrained values (e.g. socket return codes).
             if len(simgr.active) > global_vars.CONCOLIC_ACTIVE_LIMIT:
-                simgr.active = sorted(
+                simgr.stashes["active"] = sorted(
                     simgr.active,
                     key=lambda s: abs(s.addr - exit_addr),
                 )[:global_vars.CONCOLIC_ACTIVE_LIMIT]
@@ -817,7 +1143,79 @@ class StateSpaceConstructor:
 
         stack_memory_after = post_loop_state.solver.eval(post_loop_state.memory.load(stack_pointer, current_stack_frame.get_stack_size()), cast_to=bytes)
 
-        difs = self.stack_comparison(stack_memory_before, stack_memory_after)
+        # Loop vulnerability classification is based on the explicit
+        # dynamic-allocation and DWARF-buffer boundary proofs below.  Raw byte
+        # differences are not projected into the abstract frame: a CFG node can
+        # be revisited with a partially constructed frame, and ordinary locals
+        # near rbp (especially the loop counter) can then be mistaken for saved
+        # frame metadata.  The observed addresses still preserve zero-to-zero
+        # writes and are used by both precise boundary checks.
+        difs = []
+        frame_limit = concrete_sp + current_stack_frame.get_stack_size()
+        for instruction_addr, allocation_size in self._dynamic_write_allocations.items():
+            writes = {
+                address for address in observed_writes_by_instruction.get(instruction_addr, ())
+                if concrete_sp <= address < frame_limit
+            }
+            if writes and max(writes) - min(writes) + 1 > allocation_size:
+                if global_vars.DEBUG:
+                    print(
+                        f"Proven loop overflow of dynamic allocation size={allocation_size} "
+                        f"at {hex(instruction_addr)}."
+                    )
+                difs = list(range(current_stack_frame.get_stack_size()))
+                break
+        concrete_rbp = pre_loop_state.solver.eval(pre_loop_state.regs.rbp)
+        for writes in observed_writes_by_instruction.values():
+            if not writes:
+                continue
+            write_min, write_max = min(writes), max(writes)
+            if write_max - write_min + 1 != len(writes):
+                continue
+            for offset, size in self._dwarf_buffers.get(function_name, ()):
+                if len(writes) != int(size):
+                    continue
+                bias = write_min - (concrete_rbp + int(offset))
+                if abs(bias) <= 32:
+                    self._dwarf_runtime_bias[function_name] = bias
+                    break
+        dwarf_bias = self._dwarf_runtime_bias.get(function_name, 0)
+        for offset, size in self._dwarf_buffers.get(function_name, ()):
+            start = concrete_rbp + int(offset) + dwarf_bias
+            end = start + int(size)
+            boundary_width = min(8, int(size))
+            crosses_upper_boundary = any(
+                all(address in writes for address in range(end - boundary_width, end + boundary_width))
+                for writes in observed_writes_by_instruction.values()
+            )
+            crosses_lower_boundary = any(
+                all(address in writes for address in range(start - boundary_width, start + boundary_width))
+                for writes in observed_writes_by_instruction.values()
+            )
+            if crosses_upper_boundary or crosses_lower_boundary:
+                if global_vars.DEBUG:
+                    crossing = [
+                        (hex(ins_addr), min(writes), max(writes), len(writes))
+                        for ins_addr, writes in observed_writes_by_instruction.items()
+                        if (
+                            all(address in writes for address in range(end - boundary_width, end + boundary_width))
+                            or all(address in writes for address in range(start - boundary_width, start + boundary_width))
+                        )
+                    ]
+                    print(
+                        f"Proven loop overflow of DWARF buffer offset={offset} size={size}; "
+                        f"buffer_range=({start},{end}); crossing={crossing}; "
+                        "marking the stack-overflow state."
+                    )
+                difs = list(range(current_stack_frame.get_stack_size()))
+                break
+        if global_vars.DEBUG:
+            print(
+                f"Loop stack differences: count={len(difs)} "
+                f"range={((min(difs), max(difs)) if difs else None)} "
+                f"buffers={current_stack_frame.buffer_map} "
+                f"write_ranges={[(hex(addr), min(w), max(w), len(w)) for addr, w in observed_writes_by_instruction.items() if w]}"
+            )
         return function_name, difs
 
     def stack_comparison(self, stack_before, stack_after):
@@ -871,6 +1269,16 @@ class StateSpaceConstructor:
     def __get_successors(self, node):
         model = self.cfg if hasattr(self.cfg, "get_successors") else self.cfg.model
         succs = list(model.get_successors(node))
+
+        # CFGFast may attach a function return to every compatible call site in
+        # the binary.  The caller's fall-through is already explored from its
+        # call block below, so following these synthetic return edges leaks a
+        # testcase entry into unrelated Juliet support functions (and was the
+        # direct cause of the CWE-135 timeout cluster).
+        if node.block is not None:
+            insns = node.block.capstone.insns
+            if insns and insns[-1].mnemonic.startswith("ret"):
+                return []
 
         # CFGFast does not record call-return edges for PLT calls — the block
         # ending with `call plt_stub` only lists the PLT entry as successor, but

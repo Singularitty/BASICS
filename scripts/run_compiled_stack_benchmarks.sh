@@ -17,6 +17,12 @@ Options:
   --patching           Enable patching (default: --no-patching)
   --cfg-mode MODE      auto, emulated, or fast (default: fast)
   --simulation MODE    auto, static, or angr (default: static)
+  --loop-simulation MODE
+                       concolic, concolic-static, or static (default: concolic)
+  --user-call-simulation MODE
+                       concolic or structural (default: structural)
+  --concolic-step-limit N
+                       angr steps per concolic query (default: BASICS default)
   --validation-timeout SEC
                        Per validation process/GDB timeout passed to BASICS
   --no-gdb-validation  Disable GDB patch-site validation
@@ -54,6 +60,9 @@ limit=""
 patch_flag="--no-patching"
 cfg_mode="fast"
 simulation="static"
+loop_simulation="concolic"
+user_call_simulation="structural"
+concolic_step_limit=""
 metrics=1
 validation_args=()
 
@@ -89,6 +98,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --simulation)
       simulation="${2:?missing value for --simulation}"
+      shift 2
+      ;;
+    --loop-simulation)
+      loop_simulation="${2:?missing value for --loop-simulation}"
+      shift 2
+      ;;
+    --user-call-simulation)
+      user_call_simulation="${2:?missing value for --user-call-simulation}"
+      shift 2
+      ;;
+    --concolic-step-limit)
+      concolic_step_limit="${2:?missing value for --concolic-step-limit}"
       shift 2
       ;;
     --no-metrics)
@@ -137,11 +158,16 @@ run_one() {
     --jobs "$jobs"
     --cfg-mode "$cfg_mode"
     --function-simulation "$simulation"
+    --loop-simulation "$loop_simulation"
+    --user-call-simulation "$user_call_simulation"
     --patched-function-simulation "$simulation"
   )
 
   if [[ -n "$timeout_sec" ]]; then
     cmd+=(--timeout-sec "$timeout_sec")
+  fi
+  if [[ -n "$concolic_step_limit" ]]; then
+    cmd+=(--concolic-step-limit "$concolic_step_limit")
   fi
   if [[ -n "$patch_flag" ]]; then
     cmd+=("$patch_flag")
@@ -177,7 +203,7 @@ case "$dataset" in
     ;;
   juliet)
     run_one \
-      "Juliet CWE-121 isolated" \
+      "Juliet CWE-121 isolated direct entries" \
       "Benchmarks/stack_benchmark/juliet_cwe121_isolated_cases.json" \
       "juliet"
     ;;
@@ -188,7 +214,7 @@ case "$dataset" in
       "sard" \
       --dataset SARD
     run_one \
-      "Juliet CWE-121 isolated" \
+      "Juliet CWE-121 isolated direct entries" \
       "Benchmarks/stack_benchmark/juliet_cwe121_isolated_cases.json" \
       "juliet"
     ;;

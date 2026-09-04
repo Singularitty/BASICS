@@ -24,6 +24,27 @@ from src.vulnerability_identifier_removal.validator import Validator
 from src.model_checker.models.concolic_executor import ConcolicExecutor
 
 
+def _new_stage_timings():
+    return {
+        "disassembly_cfg_seconds": None,
+        "memstace_seconds": None,
+        "ltl_model_checking_seconds": None,
+        "patch_generation_seconds": None,
+        "patch_validation_seconds": None,
+        "end_to_end_seconds": None,
+        "timing_overhead_unattributed_seconds": None,
+        "stage_executed": {name: False for name in (
+            "disassembly_cfg", "memstace", "ltl_model_checking",
+            "patch_generation", "patch_validation")},
+        "patch_attempted": False,
+        "patch_succeeded": False,
+    }
+
+
+def _emit_stage_timings(timings):
+    print("@@BASICS_TIMING " + json.dumps(timings, sort_keys=True), flush=True)
+
+
 def get_arguments():
 
     parser = argparse.ArgumentParser(
@@ -206,6 +227,26 @@ def get_arguments():
         choices=["auto", "static", "angr"],
         default="auto",
         help="How to model supported C library calls. auto uses static effects first and falls back to angr.",
+    )
+
+    parser.add_argument(
+        "--loop-simulation",
+        choices=["concolic", "concolic-static", "static"],
+        default="concolic-static",
+        help=(
+            "How to model stack-writing loops. concolic matches the paper-era "
+            "behavior and skips loops when angr fails; concolic-static uses the "
+            "conservative static fallback; static avoids angr entirely."
+        ),
+    )
+    parser.add_argument(
+        "--user-call-simulation",
+        choices=["concolic", "structural"],
+        default="concolic",
+        help=(
+            "Model caller-frame effects of user-defined calls with angr, or "
+            "traverse the recovered call graph structurally without a stack-delta query."
+        ),
     )
     parser.add_argument(
         "--patched-function-simulation",
@@ -647,6 +688,7 @@ def analyze_binary(
     analysis_entry = analysis_entry or args.analysis_entry
 
     start = timer()
+    timings = _new_stage_timings()
 
     # Binary Data Extractor Module
     print("Extracting binary data\n")
@@ -657,6 +699,7 @@ def analyze_binary(
             f"Patch-aware CFG starts for {label or 'target'} binary: {len(cfg_extra_starts)}"
         )
 
+    disassembly_start = timer()
     binary_data = BinaryDataExtractor(
         binary_path,
         emulated_cfg,
@@ -669,6 +712,8 @@ def analyze_binary(
         cfg_extra_starts=cfg_extra_starts,
         find_loops=not args.cfg_skip_loopfinder,
     )
+    timings["disassembly_cfg_seconds"] = timer() - disassembly_start
+    timings["stage_executed"]["disassembly_cfg"] = True
     previous_analysis_start = global_vars.ANALYSIS_START_ADDR
     global_vars.ANALYSIS_START_ADDR = binary_data.analysis_entry_addr
     emit_binary_load_summary(binary_data, label or "target")
@@ -681,6 +726,7 @@ def analyze_binary(
 
         # Construct the state space
         print("Constructing state space\n")
+        memstace_start = timer()
         constructor = StateSpaceConstructor(
             binary_data,
             binary_name,
@@ -691,12 +737,15 @@ def analyze_binary(
             args.max_recursion_depth,
         )
         constructor.construct_state_space()
+        timings["memstace_seconds"] = timer() - memstace_start
+        timings["stage_executed"]["memstace"] = True
 
         if args.draw_state_space:
             constructor.state_space.draw()
 
         # Model check the state space
         print("Performing model checking\n")
+        ltl_start = timer()
         model_checker = ModelChecker(
             binary_name,
             constructor.state_space,
@@ -711,10 +760,17 @@ def analyze_binary(
         except Exception:
             entry_func = None
         _postprocess_report_violations(report, entry_func, binary_data.cfg)
+        timings["ltl_model_checking_seconds"] = timer() - ltl_start
+        timings["stage_executed"]["ltl_model_checking"] = True
     finally:
         global_vars.ANALYSIS_START_ADDR = previous_analysis_start
 
     end = timer()
+    timings["end_to_end_seconds"] = end - start
+    measured = sum(timings[key] or 0.0 for key in (
+        "disassembly_cfg_seconds", "memstace_seconds", "ltl_model_checking_seconds"))
+    timings["timing_overhead_unattributed_seconds"] = max(0.0, timings["end_to_end_seconds"] - measured)
+    report.basics_timings = timings
     report.set_execution_time(end - start)
     report.emit()
     return binary_data, report
@@ -1291,6 +1347,7 @@ def scan_all_functions(binary_path, security_properties, args):
 def main():
 
     args: argparse.ArgumentParser = get_arguments()
+    end_to_end_start = timer()
     current_dir, binary_name = setup_workspace(args.binary_path)
 
     global_vars.BINARY_NAME = binary_name
@@ -1318,6 +1375,8 @@ def main():
         args.cfg_fast_function_starts_only = True
 
     global_vars.FUNCTION_SIMULATION = args.function_simulation
+    global_vars.LOOP_SIMULATION = args.loop_simulation
+    global_vars.USER_CALL_SIMULATION = args.user_call_simulation
     global_vars.CONCOLIC_STEP_LIMIT = args.concolic_step_limit
     global_vars.CONCOLIC_ACTIVE_LIMIT = args.concolic_active_limit
     global_vars.LTL_BACKEND = args.ltl_backend
@@ -1362,17 +1421,29 @@ def main():
     binary_data, report = analyze_binary(
         args.binary_path, security_properties, args, "original", args.analysis_entry
     )
+    timings = getattr(report, "basics_timings", _new_stage_timings())
 
     # Identify Vulnerabilities
     vuln_identifier = Identifier(report, binary_data.cfg)
 
+    if args.no_patching:
+        timings["end_to_end_seconds"] = timer() - end_to_end_start
+        measured = sum(timings[key] or 0.0 for key in (
+            "disassembly_cfg_seconds", "memstace_seconds", "ltl_model_checking_seconds"))
+        timings["timing_overhead_unattributed_seconds"] = max(0.0, timings["end_to_end_seconds"] - measured)
+        _emit_stage_timings(timings)
+        return
+
+    timings["patch_attempted"] = True
+    timings["stage_executed"]["patch_generation"] = True
+    patch_start = timer()
     sinks = vuln_identifier.find_vulnerability()
 
     # Patch the binary
-    if args.no_patching:
-        return
     patcher = Patcher(binary_data, sinks)
     patched_binary = patcher.patch()
+    timings["patch_generation_seconds"] = timer() - patch_start
+    timings["patch_succeeded"] = patched_binary is not None
 
     if patched_binary is not None:
         validator = Validator(
@@ -1387,7 +1458,17 @@ def main():
             enable_regression=not args.no_regression_validation,
             strict_stderr=args.strict_stderr_validation,
         )
+        validation_start = timer()
         validator.validate()
+        timings["patch_validation_seconds"] = timer() - validation_start
+        timings["stage_executed"]["patch_validation"] = True
+
+    timings["end_to_end_seconds"] = timer() - end_to_end_start
+    measured = sum(timings[key] or 0.0 for key in (
+        "disassembly_cfg_seconds", "memstace_seconds", "ltl_model_checking_seconds",
+        "patch_generation_seconds", "patch_validation_seconds"))
+    timings["timing_overhead_unattributed_seconds"] = max(0.0, timings["end_to_end_seconds"] - measured)
+    _emit_stage_timings(timings)
 
 
 if __name__ == "__main__":
