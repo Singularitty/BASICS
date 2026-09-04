@@ -375,8 +375,15 @@ def run_cwe_checker(binary, case, timeout_sec):
         cmd = ["cwe_checker", "--partial", partial, "--json", str(binary)]
     elif docker_image_exists("ghcr.io/fkie-cad/cwe_checker:latest"):
         mount, inner = docker_mount_for(binary)
+        docker_limits = []
+        memory_limit_mb = os.environ.get("CWE_CHECKER_MEMORY_LIMIT_MB")
+        if memory_limit_mb:
+            docker_limits += ["--memory", f"{int(memory_limit_mb)}m"]
+        cpu_limit = os.environ.get("CWE_CHECKER_CPU_LIMIT")
+        if cpu_limit:
+            docker_limits += ["--cpus", str(float(cpu_limit))]
         cmd = [
-            "docker", "run", "--rm", "-v", f"{mount}:/input:ro",
+            "docker", "run", "--rm", *docker_limits, "-v", f"{mount}:/input:ro",
             "ghcr.io/fkie-cad/cwe_checker:latest", "--partial", partial, f"/input/{Path(inner).name}", "--json",
         ]
     else:

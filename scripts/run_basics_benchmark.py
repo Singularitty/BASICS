@@ -28,6 +28,16 @@ BO_CWE_IDS = {
 }
 
 
+def is_stack_bo_property(name: str) -> bool:
+    """Return whether an LTL violation is graded as stack-buffer overflow."""
+    normalized = name.strip().lower()
+    return bool(normalized) and "underflow" not in normalized and "underwrite" not in normalized
+
+
+def parse_property_violations(text: str) -> list[str]:
+    return sorted(set(re.findall(r"^Property:\s*(\S+)", text, re.MULTILINE)))
+
+
 def load_cases(path: Path):
     obj = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(obj, list):
@@ -108,9 +118,11 @@ def parse_report(report_text: str):
     m = re.search(r"(\d+)\s+security property violations found\.", report_text)
     if m:
         violations = int(m.group(1))
+    properties = parse_property_violations(report_text)
     return {
-        "reported_vuln": bool(cwes),
+        "reported_vuln": bool(cwes) or any(is_stack_bo_property(p) for p in properties),
         "reported_cwes": cwes,
+        "reported_properties": properties,
         "report_violation_count": violations,
     }
 
@@ -121,6 +133,7 @@ def parse_stdout(stdout: str):
         for cwe in set(re.findall(r"Potential vulnerability(?: due to loop)?\s+(CWE-\d+)", stdout))
         if cwe.rsplit("-", 1)[-1] in BO_CWE_IDS
     )
+    properties = parse_property_violations(stdout)
     patch_lines = [line for line in stdout.splitlines() if line.startswith("patched: ")]
     patch_pass = [line for line in patch_lines if " PASS " in line]
     remediation_match = re.search(r"^Patch remediation:\s+(PASS|FAIL|INCONCLUSIVE)\s*$", stdout, re.MULTILINE)
@@ -150,14 +163,25 @@ def parse_stdout(stdout: str):
         validation_status = "not_applicable"
     else:
         validation_status = "not_run"
+    timing = {}
+    for match in re.finditer(r"^@@BASICS_TIMING\s+(\{.*\})\s*$", stdout, re.MULTILINE):
+        try:
+            candidate = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            timing = candidate
     return {
         "stdout_cwes": cwes,
+        "stdout_properties": properties,
+        "reported_vuln": bool(cwes) or any(is_stack_bo_property(p) for p in properties),
         "patch_validated": (
             structured_validated
             or (bool(patch_lines) and len(patch_pass) == len(patch_lines))
         ),
         "patch_validation_status": validation_status,
         "patch_validation_lines": patch_lines,
+        "timing": timing,
     }
 
 
@@ -172,6 +196,11 @@ def parse_patch_manifest(path: Path):
         return True, 0
 
 
+def case_analysis_entry(case):
+    """Resolve both manifest spellings used by BASICS benchmark datasets."""
+    return case.get("analysis_entry") or case.get("entry_function") or ""
+
+
 def empty_result_row(case):
     return {
         "case_id": case["case_id"],
@@ -179,13 +208,20 @@ def empty_result_row(case):
         "true_present_vuln": case.get("true_present_vuln"),
         "label_confidence": case.get("label_confidence"),
         "label_rule": case.get("label_rule"),
-        "analysis_entry": case.get("analysis_entry", ""),
+        "analysis_entry": case_analysis_entry(case),
         "source_path": case.get("source_path", ""),
         "binary_path": case.get("binary_path", ""),
         "status": "ok",
         "error": "",
         "elapsed_sec": 0.0,
         "analysis_exec_time_sec": "",
+        "disassembly_cfg_sec": "",
+        "memstace_sec": "",
+        "ltl_model_checking_sec": "",
+        "patch_generation_sec": "",
+        "patch_validation_sec": "",
+        "pipeline_end_to_end_sec": "",
+        "timing_overhead_unattributed_sec": "",
         "reported_vuln": False,
         "reported_cwes": "",
         "report_violation_count": 0,
@@ -277,12 +313,13 @@ def run_case(case, basics_args: list[str], out_logs_dir: Path, timeout_sec: int 
     patched_binary_path.unlink(missing_ok=True)
 
     cmd = ["./run_basics.sh"] + basics_args
-    if case.get("analysis_entry"):
-        cmd += ["--analysis-entry", str(case["analysis_entry"])]
+    analysis_entry = case_analysis_entry(case)
+    if analysis_entry:
+        cmd += ["--analysis-entry", str(analysis_entry)]
         if case.get("patched_analysis_entry"):
             cmd += ["--patched-analysis-entry", str(case["patched_analysis_entry"])]
         else:
-            cmd += ["--patched-analysis-entry", str(case["analysis_entry"])]
+            cmd += ["--patched-analysis-entry", str(analysis_entry)]
     cmd += [str(binary)]
     start = time.perf_counter()
     try:
@@ -323,19 +360,33 @@ def run_case(case, basics_args: list[str], out_logs_dir: Path, timeout_sec: int 
     row["manifest_path"] = str(manifest_path.relative_to(ROOT)) if manifest_path.exists() else ""
 
     parsed_stdout = parse_stdout(output)
+    timing = parsed_stdout["timing"]
+    timing_columns = {
+        "disassembly_cfg_sec": "disassembly_cfg_seconds",
+        "memstace_sec": "memstace_seconds",
+        "ltl_model_checking_sec": "ltl_model_checking_seconds",
+        "patch_generation_sec": "patch_generation_seconds",
+        "patch_validation_sec": "patch_validation_seconds",
+        "pipeline_end_to_end_sec": "end_to_end_seconds",
+        "timing_overhead_unattributed_sec": "timing_overhead_unattributed_seconds",
+    }
+    for column, timing_key in timing_columns.items():
+        value = timing.get(timing_key)
+        if value is not None:
+            row[column] = value
 
     if report_path.exists():
         report_text = report_path.read_text(encoding="utf-8", errors="replace")
         parsed_report = parse_report(report_text)
         cwes = sorted(set(parsed_report["reported_cwes"]) | set(parsed_stdout["stdout_cwes"]))
-        row["reported_vuln"] = parsed_report["reported_vuln"] or bool(parsed_stdout["stdout_cwes"])
+        row["reported_vuln"] = parsed_report["reported_vuln"] or parsed_stdout["reported_vuln"]
         row["reported_cwes"] = ";".join(cwes)
         row["report_violation_count"] = parsed_report["report_violation_count"]
         mt = re.search(r"Execution Time:\s*([0-9.]+)\s*seconds", report_text)
         if mt:
             row["analysis_exec_time_sec"] = mt.group(1)
     else:
-        row["reported_vuln"] = bool(parsed_stdout["stdout_cwes"])
+        row["reported_vuln"] = parsed_stdout["reported_vuln"]
         row["reported_cwes"] = ";".join(parsed_stdout["stdout_cwes"])
 
     patched, entries = parse_patch_manifest(manifest_path)
@@ -393,6 +444,13 @@ def write_results(out_dir: Path, rows, run_stem: str | None = None):
         "error",
         "elapsed_sec",
         "analysis_exec_time_sec",
+        "disassembly_cfg_sec",
+        "memstace_sec",
+        "ltl_model_checking_sec",
+        "patch_generation_sec",
+        "patch_validation_sec",
+        "pipeline_end_to_end_sec",
+        "timing_overhead_unattributed_sec",
         "reported_vuln",
         "reported_cwes",
         "report_violation_count",
@@ -516,6 +574,8 @@ def main():
                         help="Skip cases with this label_rule (repeatable).")
     parser.add_argument("--limit", type=int, default=None, help="Run at most N cases after filtering.")
     parser.add_argument("--no-patching", action="store_true", help="Run BASICS with --no-patching.")
+    parser.add_argument("--include-experimental-properties", action="store_true",
+                        help="Pass --include-experimental-properties to BASICS.")
     parser.add_argument("--timeout-sec", type=int, default=None, help="Per-case timeout for BASICS execution.")
     parser.add_argument(
         "--jobs",
@@ -541,8 +601,27 @@ def main():
     parser.add_argument("--no-stats", action="store_true",
                         help="Do not write stats.txt/stats.json alongside results.")
     parser.add_argument("--cfg-mode", choices=["auto", "emulated", "fast"], default="auto")
+    parser.add_argument(
+        "--cfg-fast-function-starts-only",
+        action="store_true",
+        help="Seed CFGFast from the selected analysis entry instead of scanning all code.",
+    )
     parser.add_argument("--function-simulation", choices=["auto", "static", "angr"], default="static")
+    parser.add_argument(
+        "--loop-simulation",
+        choices=["concolic", "concolic-static", "static"],
+        default="concolic-static",
+    )
+    parser.add_argument(
+        "--user-call-simulation",
+        choices=["concolic", "structural"],
+        default="concolic",
+    )
     parser.add_argument("--patched-function-simulation", choices=["auto", "static", "angr"], default="static")
+    parser.add_argument("--concolic-step-limit", type=int, default=None,
+                        help="Maximum angr steps per concolic reachability query.")
+    parser.add_argument("--max-iterations", type=int, default=None,
+                        help="Maximum loop iterations executed by BASICS.")
     parser.add_argument("--memory-limit-mb", type=int, default=None, help="RSS ceiling passed to BASICS.")
     parser.add_argument("--validation-timeout", type=float, default=None,
                         help="Timeout passed to BASICS patch validation runs.")
@@ -584,11 +663,23 @@ def main():
         args.cfg_mode,
         "--function-simulation",
         args.function_simulation,
+        "--loop-simulation",
+        args.loop_simulation,
+        "--user-call-simulation",
+        args.user_call_simulation,
         "--patched-function-simulation",
         args.patched_function_simulation,
     ]
+    if args.cfg_fast_function_starts_only:
+        basics_args.append("--cfg-fast-function-starts-only")
     if args.no_patching:
         basics_args.append("--no-patching")
+    if args.include_experimental_properties:
+        basics_args.append("--include-experimental-properties")
+    if args.concolic_step_limit is not None:
+        basics_args += ["--concolic-step-limit", str(args.concolic_step_limit)]
+    if args.max_iterations is not None:
+        basics_args += ["--max-iterations", str(args.max_iterations)]
     if args.memory_limit_mb is not None:
         basics_args += ["--memory-limit-mb", str(args.memory_limit_mb)]
     if args.validation_timeout is not None:
