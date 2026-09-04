@@ -29,6 +29,8 @@ with open(DIRECTORY + "/src/vulnerabilities.json", 'r', encoding="utf-8") as dat
     
 ANGR_OPTION = None
 FUNCTION_SIMULATION = "auto"
+LOOP_SIMULATION = "concolic-static"
+USER_CALL_SIMULATION = "concolic"
 CONCOLIC_STEP_LIMIT = 10000
 CONCOLIC_ACTIVE_LIMIT = 64
 LTL_BACKEND = "auto"
