@@ -24,7 +24,7 @@ def test_render_matches_paper_metrics():
     for value in ("86.1%", "51.1%", "64.1%", "71.4%"):
         assert value in row
     assert "900 (25.5%)" in row
-    assert "3,524" in row and "errors" not in row
+    assert row.startswith("| 3,524 | ") and "errors" not in row
 
 
 def test_replace_section_keeps_surrounding_text():

@@ -87,10 +87,10 @@ def ratio(num: int, den: int) -> str:
 
 def render_table(results: dict) -> str:
     lines = [
-        "| Dataset | Cases | TP | FP | TN | FN | Precision | Recall | F1 | Accuracy | Updated |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "| Cases | TP | FP | TN | FN | Precision | Recall | F1 | Accuracy | ",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for name, e in results.items():
+    for e in results.values():
         tp, fp, tn, fn = e["TP"], e["FP"], e["TN"], e["FN"]
         graded = tp + fp + tn + fn
         cases = f"{e['cases']:,}"
@@ -98,13 +98,11 @@ def render_table(results: dict) -> str:
             cases += f" ({e['errors']:,} errors)"
         counts = [f"{n:,} ({ratio(n, graded)})" for n in (tp, fp, tn, fn)]
         lines.append("| " + " | ".join([
-            name, cases, *counts,
+            cases, *counts,
             ratio(tp, tp + fp), ratio(tp, tp + fn), ratio(2 * tp, 2 * tp + fp + fn),
-            ratio(tp + tn, graded), e["updated"],
-        ]) + " |")
-    sources = "; ".join(f"{name}: {e['source']}" for name, e in results.items())
-    lines += ["", f"Percentages next to counts are shares of graded cases. Source: {sources}."]
-    return "\n".join(lines)
+            ratio(tp + tn, graded),
+        ]) + " | ")
+    return "\n".join(lines) + "\n"
 
 
 def replace_section(text: str, table: str) -> str:
