@@ -1,5 +1,3 @@
-from PIL import Image, ImageDraw, ImageFont
-
 from copy import deepcopy
 from src.model_checker.models.stack_frame import StackFrame
 from src.exceptions import NonExistentStackFrame
