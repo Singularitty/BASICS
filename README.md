@@ -84,20 +84,13 @@ validation writes reports under `reports/<binary>/`.
 
 ## Benchmark Results
 
-Current detection results. After a benchmark run that improves on these, publish
-it with:
-
-```bash
-python3 scripts/update_benchmark_table.py --dataset "Juliet CWE-121" \
-    --run Benchmarks/stack_benchmark/results/<run>
-```
+Current detection results on the Juliet C/C++ CWE121 dataset
 
 <!-- benchmark-table:start -->
-| Dataset | Cases | TP | FP | TN | FN | Precision | Recall | F1 | Accuracy | Updated |
+| Dataset | Cases | TP | FP | TN | FN | Precision | Recall | F1 | Accuracy | 
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Juliet CWE-121 | 3,524 | 900 (25.5%) | 145 (4.1%) | 1,617 (45.9%) | 862 (24.5%) | 86.1% | 51.1% | 64.1% | 71.4% | 2026-10-04 |
+| Juliet CWE-121 | 3,524 | 900 (25.5%) | 145 (4.1%) | 1,617 (45.9%) | 862 (24.5%) | 86.1% | 51.1% | 64.1% | 71.4% | 
 
-Percentages next to counts are shares of graded cases. Source: Juliet CWE-121: Computers & Security paper, Table "Detection results on the Juliet CWE-121 dataset".
 <!-- benchmark-table:end -->
 
 ## Cite BASICS
