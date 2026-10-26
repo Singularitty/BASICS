@@ -1,14 +1,18 @@
 start: expr
 
-?expr: expr "||" term           -> or_expr
-     | term
+// A quantifier's body extends as far right as possible:
+// `exists_stack s: a && b` binds s in both a and b.
+?expr: quantifier
+     | disjunction
+
+?disjunction: disjunction "||" term  -> or_expr
+            | term
 
 ?term: term "&&" factor        -> and_expr
      | factor
 
 ?factor: "!" atom             -> not_expr
        | comparison
-       | quantifier
 
 ?comparison: atom comparator atom -> comparison_expr
            | atom

@@ -13,6 +13,7 @@ import claripy
 # User modules
 import src.global_vars as global_vars
 import src.model_checker.models.emulated_functions as simulator
+import src.model_checker.models.emulation_trace as emulation_trace
 from src.model_checker.models.wrappers import MemoryAddress
 from src.model_checker.models.memory_transitions import MemoryOperation, OperationType
 from src.model_checker.models.stack_frame import StackFrame
@@ -52,6 +53,7 @@ class CType(NamedTuple):
 
 # Compost C types
 CHAR_BUFF = CType(DataType.POINTER, 8, CType(DataType.CHAR, 1))
+WCHAR_BUFF = CType(DataType.POINTER, 8, CType(DataType.INT, 4))
 SIZE_ARG = CType(DataType.SIZE_T, 8)
 INT_ARG = CType(DataType.INT, 4)
 VOID_PTR = CType(DataType.POINTER, 8)
@@ -79,7 +81,18 @@ C_LIB_FUNCTION_DATA = {
     "fgets": {"safe": True, "arguments": [CHAR_BUFF, INT_ARG, VOID_PTR]},
     "read": {"safe": False, "arguments": [INT_ARG, CHAR_BUFF, SIZE_ARG]},
     "recv": {"safe": False, "arguments": [INT_ARG, CHAR_BUFF, SIZE_ARG, INT_ARG]},
+    "wcscpy": {"safe": False, "arguments": [WCHAR_BUFF, WCHAR_BUFF]},
+    "wcsncpy": {"safe": False, "arguments": [WCHAR_BUFF, WCHAR_BUFF, SIZE_ARG]},
+    "wcscat": {"safe": False, "arguments": [WCHAR_BUFF, WCHAR_BUFF]},
+    "wcsncat": {"safe": False, "arguments": [WCHAR_BUFF, WCHAR_BUFF, SIZE_ARG]},
+    "wmemcpy": {"safe": False, "arguments": [WCHAR_BUFF, WCHAR_BUFF, SIZE_ARG]},
+    "wmemmove": {"safe": False, "arguments": [WCHAR_BUFF, WCHAR_BUFF, SIZE_ARG]},
+    "wmemset": {"safe": False, "arguments": [WCHAR_BUFF, INT_ARG, SIZE_ARG]},
+    "swprintf": {"safe": True, "arguments": [WCHAR_BUFF, SIZE_ARG, WCHAR_BUFF]},
 }
+
+# sizeof(wchar_t) on x86-64 Linux
+WCHAR_SIZE = 4
 
 PARAMETER_REGISTERS = {0: "rdi", 1: "rsi",
                        2: "rdx", 3: "rcx", 
@@ -208,7 +221,9 @@ class CallEmulator:
                  project: angr.Project,
                  user_functions,
                  binary_path: str,
-                 concolic_exection=True):
+                 concolic_exection=True,
+                 path_blocks=None,
+                 pointer_destinations=None):
 
         self.stack_frame = current_stack_frame
         self.call_instruction = call_instruction
@@ -227,9 +242,20 @@ class CallEmulator:
         self.source_length_upper_bound = None
         self.register_malloc_sizes = {}
         self.rsp_allocation_size = None
+        self.alloca_requested_size = None
+        self.register_literal_addresses = {}
+        self._slot_constants = {}
         self.binary_path = binary_path
+        # Block addresses of the explored path leading to the call, if known.
+        self.path_blocks = path_blocks
         self.project = project
         self.generic_call = False
+        # {register: (frame, rbp offset, size)} for arguments the caller proved
+        # to point into another function's stack buffer (e.g. a sink's pointer
+        # parameter).  When the destination is one of them the static model is
+        # evaluated against that frame and pointer_destination_register is set.
+        self.pointer_destinations = pointer_destinations or {}
+        self.pointer_destination_register = None
 
         if concolic_exection:
             if self.setup():
@@ -324,46 +350,118 @@ class CallEmulator:
                                                     entry_addr=entry_addr,
                                                     target_addr=target_addr,
                                                     fname=self.function_name)
+        emulated_call.bind_call_site(self.target_node, self.call_instruction)
         try:
             stack_changes = emulated_call.run()
+            if stack_changes and emulated_call.destination_overflow:
+                # Same policy as the static model for a proven overflow.
+                if global_vars.DEBUG:
+                    print(f"angr: {self.function_name} wrote past its destination buffer; using full-frame write.")
+                stack_changes = self.__full_stack_write()
             if self.function_name in global_vars.STDIN_FUNCTIONS:
                 self.save_concolic_input(self.function_name, emulated_call.concolic_input())
-        except Exception: # f it, catch it all!
-            print("Failed to execute function. Skipping...")
+        except Exception as error: # f it, catch it all!
+            self.trace_error = f"{type(error).__name__}: {error}"
+            print(f"Failed to execute function ({type(error).__name__}: {error}). Skipping...")
             stack_changes = []
         return stack_changes
 
     def __model_stack_effects(self):
+        stack_changes = self.__model_stack_effects_inner()
+        if emulation_trace.enabled():
+            self.__trace_outcome(stack_changes)
+        return stack_changes
+
+    def __trace_outcome(self, stack_changes):
+        if self.trace_path == "static" and not stack_changes:
+            kind = "no_write"
+        elif self.trace_path == "static" and stack_changes == self.__full_stack_write():
+            kind = "full_frame"
+        elif self.trace_path == "static":
+            kind = "partial"
+        else:
+            kind = self.trace_path
+        emulation_trace.record(
+            function=self.function_name,
+            call_addr=hex(self.call_addr),
+            generic=self.generic_call,
+            outcome=kind,
+            error=self.trace_error,
+            written=len(stack_changes),
+            stack_size=self.stack_frame.get_stack_size(),
+            buffer_map={reg: list(value) for reg, value in self.buffer_map.items()},
+        )
+
+    def __model_stack_effects_inner(self):
+        self.trace_path = "angr"
+        self.trace_error = None
         if global_vars.FUNCTION_SIMULATION in ("auto", "static"):
-            stack_changes = self.__static_stack_effects()
+            stack_changes = self.__pointer_destination_stack_effects()
+            if stack_changes is None:
+                stack_changes = self.__static_stack_effects()
+            self.trace_path = "static"
             if stack_changes is not None:
                 if not global_vars.SCAN_MODE:
                     print(f"Using static stack-effect model for {self.function_name}.")
                 if self.function_name in global_vars.STDIN_FUNCTIONS:
                     self.save_concolic_input(self.function_name, "A" * max(1, min(self.stack_frame.get_stack_size(), 4096)))
                 return stack_changes
+            self.trace_path = "unmodelled_skipped"
             if global_vars.FUNCTION_SIMULATION == "static":
                 if not global_vars.SCAN_MODE:
                     print(f"Could not statically model {self.function_name}; skipping angr fallback.")
                 return []
+            self.trace_path = "unmodelled_angr"
         return self.concolic_execution()
 
-    def __static_stack_effects(self):
+    def __pointer_destination_stack_effects(self):
+        """Static model for a destination that points into another frame."""
+        destination_register = self.__static_destination_register()
+        destination = self.pointer_destinations.get(destination_register)
+        if destination is None:
+            return None
+        frame, offset, size = destination
+        if offset is None:
+            # Dynamic allocation: only a proven overflow is modelled, as for
+            # a local alloca destination.  The write size is capped by the
+            # current frame: the owner's frame model does not include the
+            # allocation, so its size would understate the write.
+            write_size = self.__static_write_size(size)
+            if write_size is None:
+                return None
+            self.stack_frame = frame
+            self.pointer_destination_register = destination_register
+            if write_size > size and self.__known_local_overflow(size, write_size):
+                if global_vars.DEBUG:
+                    print(
+                        f"Static call effect: {self.function_name} overflows another frame's dynamic "
+                        f"allocation write_size={write_size} alloca_size={size}; using full-frame write."
+                    )
+                return self.__full_stack_write()
+            return []
+        local_frame, local_buffer = self.stack_frame, self.buffer_map.get(destination_register)
+        self.stack_frame = frame
+        self.buffer_map[destination_register] = (offset, size)
+        stack_changes = self.__static_stack_effects()
+        if stack_changes is None:
+            self.stack_frame = local_frame
+            if local_buffer is None:
+                self.buffer_map.pop(destination_register, None)
+            else:
+                self.buffer_map[destination_register] = local_buffer
+            return None
         if global_vars.DEBUG:
-            print(f"Static call buffer map for {self.function_name}: {self.buffer_map}")
+            print(
+                f"Static call effect: {self.function_name} destination {destination_register} "
+                f"points into another frame at offset={offset} size={size}."
+            )
+        self.pointer_destination_register = destination_register
+        return stack_changes
+
+    def __static_destination_register(self):
         if self.function_name in ("scanf", "fscanf", "sscanf"):
-            format_register, first_output_register = {
-                "scanf": ("rdi", "rsi"),
-                "fscanf": ("rsi", "rdx"),
-                "sscanf": ("rsi", "rdx"),
-            }[self.function_name]
-            write_size = self.__format_write_size(self.stack_frame.get_stack_size(), format_register)
-            if write_size == 0:
-                return []
-            destination_register = first_output_register
-        else:
-            destination_register = None
-        destination_register = {
+            return {"scanf": "rsi", "fscanf": "rdx", "sscanf": "rdx"}[self.function_name]
+        return {
             "strcpy": "rdi",
             "stpcpy": "rdi",
             "strncpy": "rdi",
@@ -380,7 +478,29 @@ class CallEmulator:
             "fgets": "rdi",
             "read": "rsi",
             "recv": "rsi",
-        }.get(self.function_name, destination_register)
+            "wcscpy": "rdi",
+            "wcsncpy": "rdi",
+            "wcscat": "rdi",
+            "wcsncat": "rdi",
+            "wmemcpy": "rdi",
+            "wmemmove": "rdi",
+            "wmemset": "rdi",
+            "swprintf": "rdi",
+        }.get(self.function_name)
+
+    def __static_stack_effects(self):
+        if global_vars.DEBUG:
+            print(f"Static call buffer map for {self.function_name}: {self.buffer_map}")
+        if self.function_name in ("scanf", "fscanf", "sscanf"):
+            format_register = {
+                "scanf": "rdi",
+                "fscanf": "rsi",
+                "sscanf": "rsi",
+            }[self.function_name]
+            write_size = self.__format_write_size(self.stack_frame.get_stack_size(), format_register)
+            if write_size == 0:
+                return []
+        destination_register = self.__static_destination_register()
         if destination_register is None:
             return None
         if destination_register not in self.buffer_map:
@@ -422,6 +542,8 @@ class CallEmulator:
             return None
 
         write_size = self.__static_write_size(destination_size)
+        if write_size is None:
+            return None
         if write_size <= 0:
             return []
         if self.__known_local_overflow(destination_size, write_size):
@@ -489,7 +611,14 @@ class CallEmulator:
             "strcpy", "stpcpy", "strncpy", "strcat", "strncat",
             "sprintf", "snprintf", "vsprintf", "vsnprintf", "memcpy", "memmove", "memset",
             "read", "recv", "gets", "scanf", "fscanf", "sscanf",
+            "wcscpy", "wcsncpy", "wcscat", "wcsncat", "wmemcpy", "wmemmove", "wmemset", "swprintf",
         )
+
+    def __alloca_logical_size(self):
+        """Size the program asked alloca for, falling back to the rounded allocation."""
+        if self.alloca_requested_size is not None and self.rsp_allocation_size:
+            return min(self.alloca_requested_size, self.rsp_allocation_size)
+        return self.rsp_allocation_size
 
     def __rsp_alloca_overflow_indices_for_register(self, register_name):
         arg = self.expected_parameters.get(register_name)
@@ -497,7 +626,7 @@ class CallEmulator:
             return None
         if arg.value != "rsp":
             return None
-        allocation_size = self.register_malloc_sizes.get(register_name, self.rsp_allocation_size)
+        allocation_size = self.register_malloc_sizes.get(register_name, self.__alloca_logical_size())
         write_size = self.__static_write_size(allocation_size)
         if write_size is None:
             return None
@@ -573,12 +702,16 @@ class CallEmulator:
                 return min(stack_size, max(0, int(source_length)) + 1)
             source_size = self.__buffer_size_for_register("rsi")
             if source_size is None:
-                return destination_size
+                return None  # source length unknown: let the angr fallback decide
             return min(stack_size, source_size)
         if self.function_name == "strncat":
             length = self.__integer_argument_for_register("rdx")
             if length is None:
                 length = stack_size
+            # At most strlen(src) bytes are appended when the source is shorter than n.
+            source_length = self.__string_length_for_register("rsi")
+            if source_length is not None:
+                length = min(int(length), int(source_length))
             # strncat appends to the current C-string length, not to the
             # destination buffer capacity. Juliet's fixed-size sinks initialize
             # dest as an empty string before the call, so model the appended
@@ -598,7 +731,7 @@ class CallEmulator:
                 if destination_size is not None and source_size > destination_size:
                     return stack_size
                 return min(stack_size, source_size)
-            return destination_size
+            return None  # source length unknown: let the angr fallback decide
         if self.function_name == "strncpy":
             length = self.__integer_argument_for_register("rdx")
             if length is None:
@@ -613,7 +746,7 @@ class CallEmulator:
             # Format string is known but has unbounded %s → treat as full overflow
             if self.__string_argument_for_register("rsi") is not None:
                 return stack_size
-            return destination_size
+            return None  # source length unknown: let the angr fallback decide
         if self.function_name in ("snprintf", "vsnprintf"):
             length = self.__integer_argument_for_register("rsi")
             if length is None:
@@ -638,6 +771,35 @@ class CallEmulator:
             if length is None:
                 return stack_size
             return min(stack_size, max(0, int(length)))
+        if self.function_name in ("wcscpy", "wcscat"):
+            # wcscat is modelled like strcat: Juliet sinks append to an empty dest.
+            wide_length = self.__wide_string_length_for_register("rsi")
+            if wide_length is not None:
+                return min(stack_size, (wide_length + 1) * WCHAR_SIZE)
+            source_size = self.__buffer_size_for_register("rsi")
+            if source_size is not None:
+                if destination_size is not None and source_size > destination_size:
+                    return stack_size
+                return min(stack_size, source_size)
+            return None  # source length unknown: let the angr fallback decide
+        if self.function_name in ("wcsncpy", "wmemcpy", "wmemmove", "wmemset"):
+            count = self.__integer_argument_for_register("rdx")
+            if count is None:
+                return stack_size
+            return min(stack_size, max(0, int(count)) * WCHAR_SIZE)
+        if self.function_name == "wcsncat":
+            count = self.__integer_argument_for_register("rdx")
+            if count is None:
+                return stack_size
+            wide_length = self.__wide_string_length_for_register("rsi")
+            if wide_length is not None:
+                count = min(int(count), wide_length)
+            return min(stack_size, (max(0, int(count)) + 1) * WCHAR_SIZE)
+        if self.function_name == "swprintf":
+            count = self.__integer_argument_for_register("rsi")
+            if count is None:
+                return stack_size
+            return min(stack_size, max(0, int(count)) * WCHAR_SIZE)
         return None
 
     def __format_write_size(self, default_size, format_register=None):
@@ -687,6 +849,11 @@ class CallEmulator:
         if fmt is None:
             return None
 
+        # Variadic arguments follow the format register in SysV order; stack
+        # arguments are not tracked.
+        argument_registers = list(PARAMETER_REGISTERS.values())
+        argument_registers = argument_registers[argument_registers.index(format_register) + 1:]
+
         total = 0
         index = 0
         pattern = re.compile(
@@ -710,18 +877,41 @@ class CallEmulator:
                 return None
 
             width = int(width_text) if width_text else 0
+            argument_register = None
+            if conv not in "%":
+                argument_register = argument_registers.pop(0) if argument_registers else None
+            wide = match.group("length") in ("l", "ll", "j", "z", "t")
             if conv == "%":
                 contribution = 1
             elif conv == "n":
                 contribution = 0
             elif conv == "s":
-                if precision_text is None:
+                length = None
+                if argument_register is not None:
+                    length = self.__string_length_for_register(argument_register)
+                    literal = self.register_literal_addresses.get(argument_register)
+                    if length is None and literal is not None:
+                        length = self.__narrow_literal_length(literal)
+                if precision_text is not None:
+                    length = int(precision_text) if length is None else min(length, int(precision_text))
+                if length is None:
                     return None
-                contribution = int(precision_text)
+                contribution = max(width, length)
             elif conv == "c":
                 contribution = max(width, 1)
             elif conv in "diuoxXp":
-                contribution = max(width, 20)
+                # Longest rendering of the argument type, e.g. "-2147483648" for %d.
+                if conv == "p":
+                    digits = 18
+                elif conv in "di":
+                    digits = 20 if wide else 11
+                elif conv == "u":
+                    digits = 20 if wide else 10
+                elif conv == "o":
+                    digits = 22 if wide else 11
+                else:
+                    digits = 16 if wide else 8
+                contribution = max(width, digits)
             elif conv in "fFeEgGaA":
                 precision = int(precision_text) if precision_text is not None else 6
                 contribution = max(width, precision + 16)
@@ -796,6 +986,28 @@ class CallEmulator:
         if isinstance(arg.value, int):
             return arg.value
         return None
+
+    def __wide_string_length_for_register(self, register_name):
+        addr = self.register_literal_addresses.get(register_name)
+        if addr is None:
+            return None
+        return self.__wide_literal_length(addr)
+
+    def __wide_literal_length(self, addr, max_chars=4096):
+        try:
+            data = self.project.loader.memory.load(addr, max_chars * WCHAR_SIZE)
+        except Exception:
+            return None
+        for index in range(0, len(data) - WCHAR_SIZE + 1, WCHAR_SIZE):
+            if data[index:index + WCHAR_SIZE] == b"\x00" * WCHAR_SIZE:
+                return index // WCHAR_SIZE
+        return None
+
+    def __narrow_literal_length(self, addr):
+        value = self.__read_c_string(addr)
+        if value is None:
+            return None
+        return len(value.encode("utf-8", errors="ignore"))
 
     def __string_length_for_register(self, register_name):
         length = self.register_string_length_values.get(register_name)
@@ -1065,7 +1277,13 @@ class CallEmulator:
             return self.target_node.block.capstone.insns
 
         instructions = []
-        for addr in sorted(func.block_addrs):
+        block_addrs = sorted(func.block_addrs)
+        if self.path_blocks:
+            function_blocks = set(func.block_addrs)
+            on_path = [addr for addr in self.path_blocks if addr in function_blocks]
+            if on_path and on_path[-1] == self.target_node.addr:
+                block_addrs = on_path
+        for addr in block_addrs:
             if addr > self.call_addr:
                 continue
             try:
@@ -1085,6 +1303,9 @@ class CallEmulator:
         register_malloc_source_slots = {}  # reg → rbp-slot the malloc ptr was loaded from
         register_string_lengths = {}
         local_string_length_map = {}
+        # Absolute addresses of rip-relative literals (e.g. L"AAAA") per register / rbp slot
+        register_literal_addresses = {}
+        local_literal_addresses = {}
         stack_string_length_map = {}
         stack_immediate_bytes = {}
         last_cmp_bound = None
@@ -1094,9 +1315,10 @@ class CallEmulator:
             if ins.address >= self.call_addr:
                 break
             self.__track_alloca_constants(ins, register_constants)
-            if self.rsp_allocation_size is not None and self.rsp_allocation_size > 0 and self.rsp_allocation_size != last_rsp_allocation_size:
-                register_malloc_sizes["rsp"] = self.rsp_allocation_size
-                last_rsp_allocation_size = self.rsp_allocation_size
+            logical_size = self.__alloca_logical_size()
+            if self.rsp_allocation_size is not None and self.rsp_allocation_size > 0 and logical_size != last_rsp_allocation_size:
+                register_malloc_sizes["rsp"] = logical_size
+                last_rsp_allocation_size = logical_size
             match ins.mnemonic:
                 case "cmp":
                     last_cmp_bound = self.__cmp_upper_bound(ins)
@@ -1108,6 +1330,7 @@ class CallEmulator:
                 case "call":
                     # Any call clobbers rax (return value) — clear stale stack tracking for it
                     register_points_to_stack.pop("rax", None)
+                    register_literal_addresses.pop("rax", None)
                     register_malloc_sizes.pop("rax", None)
                     register_malloc_source_slots.pop("rax", None)
                     register_string_lengths.pop("rax", None)
@@ -1143,8 +1366,17 @@ class CallEmulator:
                                             if local_size == dest_size:
                                                 local_string_length_map[local_slot] = int(size)
                             register_constants.pop("rax", None)
+                        elif fname == "wcslen":
+                            literal = register_literal_addresses.get("rdi")
+                            length = self.__wide_literal_length(literal) if literal is not None else None
+                            if length is not None:
+                                register_constants["rax"] = int(length)
+                            else:
+                                register_constants.pop("rax", None)
                         elif fname == "strlen":
                             length = register_string_lengths.get("rdi")
+                            if length is None and "rdi" in register_literal_addresses:
+                                length = self.__narrow_literal_length(register_literal_addresses["rdi"])
                             slot = register_malloc_source_slots.get("rdi")
                             if length is None and slot is not None:
                                 length = local_string_length_map.get(slot)
@@ -1167,6 +1399,9 @@ class CallEmulator:
                         continue
                     reg_name = get_register_name(ins, ins.operands[0])
                     mem = get_operand_value(ins, ins.operands[1])
+                    register_literal_addresses.pop(reg_name, None)
+                    if isinstance(mem, MemoryAddress) and canonical_register(mem.base_register) == "rip":
+                        register_literal_addresses[reg_name] = self.__resolve_static_address(mem, ins)
                     register_malloc_sizes.pop(reg_name, None)
                     register_malloc_source_slots.pop(reg_name, None)
                     register_string_lengths.pop(reg_name, None)
@@ -1182,6 +1417,8 @@ class CallEmulator:
                                 length += 1
                             if stack_immediate_bytes.get(start + length) == 0:
                                 register_string_lengths[reg_name] = length
+                            elif abs(start) in stack_string_length_map:
+                                register_string_lengths[reg_name] = stack_string_length_map[abs(start)]
                 case "add" | "sub":
                     if len(ins.operands) < 2 or not is_register(ins.operands[0]) or not is_immediate(ins.operands[1]):
                         continue
@@ -1214,6 +1451,16 @@ class CallEmulator:
                                     stack_immediate_bytes[start + byte_index] = (
                                         value >> (8 * byte_index)
                                     ) & 0xff
+                    if is_register(ins.operands[0]) and is_immediate(ins.operands[1]):
+                        # An immediate replaces whatever pointer or length the
+                        # register held (e.g. movabs rax, 0x4141... after lea).
+                        dst_reg = get_register_name(ins, ins.operands[0])
+                        register_points_to_stack.pop(dst_reg, None)
+                        register_literal_addresses.pop(dst_reg, None)
+                        register_malloc_sizes.pop(dst_reg, None)
+                        register_malloc_source_slots.pop(dst_reg, None)
+                        register_string_lengths.pop(dst_reg, None)
+                        continue
                     if is_register(ins.operands[0]) and is_register(ins.operands[1]):
                         dst_reg = get_register_name(ins, ins.operands[0])
                         src_reg = get_register_name(ins, ins.operands[1])
@@ -1226,7 +1473,7 @@ class CallEmulator:
                         if src_reg in register_malloc_sizes:
                             register_malloc_sizes[dst_reg] = register_malloc_sizes[src_reg]
                         elif src_reg == "rsp" and self.rsp_allocation_size is not None:
-                            register_malloc_sizes[dst_reg] = self.rsp_allocation_size
+                            register_malloc_sizes[dst_reg] = self.__alloca_logical_size()
                         else:
                             register_malloc_sizes.pop(dst_reg, None)
                         if src_reg in register_malloc_source_slots:
@@ -1237,12 +1484,20 @@ class CallEmulator:
                             register_string_lengths[dst_reg] = register_string_lengths[src_reg]
                         else:
                             register_string_lengths.pop(dst_reg, None)
+                        if src_reg in register_literal_addresses:
+                            register_literal_addresses[dst_reg] = register_literal_addresses[src_reg]
+                        else:
+                            register_literal_addresses.pop(dst_reg, None)
                         continue
                     if is_register(ins.operands[0]) and is_memory(ins.operands[1]):
                         dst_reg = get_register_name(ins, ins.operands[0])
                         src_mem = get_operand_value(ins, ins.operands[1])
                         if isinstance(src_mem, MemoryAddress) and canonical_register(src_mem.base_register) == "rbp":
                             local_slot = abs(src_mem.displacement or 0)
+                            if local_slot in local_literal_addresses:
+                                register_literal_addresses[dst_reg] = local_literal_addresses[local_slot]
+                            else:
+                                register_literal_addresses.pop(dst_reg, None)
                             if local_slot in self.local_pointer_map:
                                 register_points_to_stack[dst_reg] = self.local_pointer_map[local_slot]
                             else:
@@ -1253,8 +1508,16 @@ class CallEmulator:
                             else:
                                 register_malloc_sizes.pop(dst_reg, None)
                                 register_malloc_source_slots.pop(dst_reg, None)
+                            pointed = self.local_pointer_map.get(local_slot)
                             if local_slot in local_string_length_map:
                                 register_string_lengths[dst_reg] = local_string_length_map[local_slot]
+                            elif (
+                                isinstance(pointed, MemoryAddress)
+                                and canonical_register(pointed.base_register) == "rbp"
+                                and abs(pointed.displacement or 0) in stack_string_length_map
+                            ):
+                                # data = buf; memset(data, 'A', n); data[n] = 0; strcpy(dst, data)
+                                register_string_lengths[dst_reg] = stack_string_length_map[abs(pointed.displacement or 0)]
                             else:
                                 register_string_lengths.pop(dst_reg, None)
                         elif (
@@ -1264,9 +1527,17 @@ class CallEmulator:
                             and canonical_register(src_mem.base_register) in register_points_to_stack
                         ):
                             # Indirect dereference: mov dst, [reg] where reg → rbp slot
+                            register_literal_addresses.pop(dst_reg, None)
                             base = canonical_register(src_mem.base_register)
                             pointed_mem = register_points_to_stack[base]
                             register_points_to_stack.pop(dst_reg, None)
+                            if isinstance(pointed_mem, MemoryAddress) and canonical_register(pointed_mem.base_register) == "rbp":
+                                # data = *dataPtr where dataPtr = &data (char **)
+                                pointed_slot = abs(pointed_mem.displacement or 0)
+                                if pointed_slot in self.local_pointer_map:
+                                    register_points_to_stack[dst_reg] = self.local_pointer_map[pointed_slot]
+                                if pointed_slot in local_literal_addresses:
+                                    register_literal_addresses[dst_reg] = local_literal_addresses[pointed_slot]
                             if isinstance(pointed_mem, MemoryAddress) and canonical_register(pointed_mem.base_register) == "rbp":
                                 deref_slot = abs(pointed_mem.displacement or 0)
                                 if deref_slot in self.local_malloc_size_map:
@@ -1277,6 +1548,13 @@ class CallEmulator:
                                     register_malloc_source_slots.pop(dst_reg, None)
                                 if deref_slot in local_string_length_map:
                                     register_string_lengths[dst_reg] = local_string_length_map[deref_slot]
+                                elif (
+                                    isinstance(register_points_to_stack.get(dst_reg), MemoryAddress)
+                                    and abs(register_points_to_stack[dst_reg].displacement or 0) in stack_string_length_map
+                                ):
+                                    register_string_lengths[dst_reg] = stack_string_length_map[
+                                        abs(register_points_to_stack[dst_reg].displacement or 0)
+                                    ]
                                 else:
                                     register_string_lengths.pop(dst_reg, None)
                             else:
@@ -1285,6 +1563,7 @@ class CallEmulator:
                                 register_string_lengths.pop(dst_reg, None)
                         else:
                             register_points_to_stack.pop(dst_reg, None)
+                            register_literal_addresses.pop(dst_reg, None)
                             register_malloc_sizes.pop(dst_reg, None)
                             register_malloc_source_slots.pop(dst_reg, None)
                             register_string_lengths.pop(dst_reg, None)
@@ -1293,6 +1572,16 @@ class CallEmulator:
                         continue
                     dst = get_operand_value(ins, ins.operands[0])
                     src = get_register_name(ins, ins.operands[1])
+                    if (
+                        isinstance(dst, MemoryAddress)
+                        and dst.index_register is None
+                        and dst.displacement is None
+                        and dst.base_register is not None
+                        and isinstance(register_points_to_stack.get(canonical_register(dst.base_register)), MemoryAddress)
+                        and canonical_register(register_points_to_stack[canonical_register(dst.base_register)].base_register) == "rbp"
+                    ):
+                        # *dataPtr = data: the store lands in the slot dataPtr points at
+                        dst = register_points_to_stack[canonical_register(dst.base_register)]
                     if isinstance(dst, MemoryAddress) and canonical_register(dst.base_register) == "rbp":
                         width = int(getattr(ins.operands[0], "size", 0) or 0)
                         constant = register_constants.get(src)
@@ -1304,15 +1593,28 @@ class CallEmulator:
                                     value >> (8 * byte_index)
                                 ) & 0xff
                         slot = abs(dst.displacement or 0)
+                        # A store overwrites the slot, so drop facts the old
+                        # value carried when the new one has none.
                         if src in register_points_to_stack:
                             self.local_pointer_map[slot] = register_points_to_stack[src]
+                        else:
+                            self.local_pointer_map.pop(slot, None)
                         if src in register_malloc_sizes:
                             self.local_malloc_size_map[slot] = register_malloc_sizes[src]
+                        else:
+                            self.local_malloc_size_map.pop(slot, None)
                         if src in register_string_lengths:
                             local_string_length_map[slot] = register_string_lengths[src]
+                        else:
+                            local_string_length_map.pop(slot, None)
+                        if src in register_literal_addresses:
+                            local_literal_addresses[slot] = register_literal_addresses[src]
+                        else:
+                            local_literal_addresses.pop(slot, None)
         self.register_malloc_sizes = register_malloc_sizes
         self.register_constant_values = register_constants
         self.register_string_length_values = register_string_lengths
+        self.register_literal_addresses = register_literal_addresses
         if global_vars.DEBUG and register_string_lengths:
             print(f"Recovered string lengths: {register_string_lengths}")
         if global_vars.DEBUG and register_malloc_sizes:
@@ -1351,6 +1653,9 @@ class CallEmulator:
                 return
             register_constants["rax"] = dividend // divisor
             register_constants["rdx"] = dividend % divisor
+            return
+        if is_memory(ins.operands[0]):
+            self.__track_slot_constant(ins, register_constants)
             return
         if len(ins.operands) < 2:
             return
@@ -1400,12 +1705,25 @@ class CallEmulator:
                     else:
                         register_constants[dst_reg] = value
                 else:
-                    register_constants.pop(dst_reg, None)
+                    # size_t n = strlen(src); ... reload of n from its stack slot
+                    value = self._slot_constants.get(self.__rbp_slot(get_operand_value(ins, src)))
+                    if value is None:
+                        register_constants.pop(dst_reg, None)
+                    else:
+                        register_constants[dst_reg] = value
             case "add" | "sub":
-                if not is_immediate(src) or dst_reg not in register_constants:
+                if is_immediate(src):
+                    delta = int(src.imm)
+                elif is_register(src):
+                    delta = register_constants.get(get_register_name(ins, src))
+                else:
+                    delta = None
+                if delta is None or dst_reg not in register_constants:
                     register_constants.pop(dst_reg, None)
                     return
-                delta = int(src.imm)
+                if ins.mnemonic == "add" and dst_reg == "rax" and register_constants[dst_reg] == 15 and delta > 8:
+                    # GCC -O0 alloca(n): mov eax,0x10; sub rax,1; add rax,n+8
+                    self.alloca_requested_size = delta - 8
                 if ins.mnemonic == "sub":
                     delta = -delta
                 register_constants[dst_reg] += delta
@@ -1420,10 +1738,74 @@ class CallEmulator:
                     register_constants[dst_reg] *= int(src.imm)
                 else:
                     register_constants.pop(dst_reg, None)
+            case "lea":
+                # e.g. strlen(src) + 1:  lea rdx, [rax+0x1]
+                mem = get_operand_value(ins, src)
+                value = None
+                if isinstance(mem, MemoryAddress) and mem.base_register is not None:
+                    base = register_constants.get(canonical_register(mem.base_register))
+                    index = 0
+                    if mem.index_register is not None:
+                        index = register_constants.get(canonical_register(mem.index_register))
+                        if index is not None:
+                            index *= int(mem.scale or 1)
+                    if base is not None and index is not None:
+                        value = int(base) + index + int(mem.displacement or 0)
+                if value is None:
+                    register_constants.pop(dst_reg, None)
+                else:
+                    register_constants[dst_reg] = value
+            case "and" | "or" | "shl" | "shr" | "sar":
+                # Part of GCC's alloca size rounding (and edx, 0xfff; shr/shl 4).
+                value = register_constants.get(dst_reg)
+                if value is None or not is_immediate(src):
+                    register_constants.pop(dst_reg, None)
+                    return
+                imm = int(src.imm)
+                register_constants[dst_reg] = {
+                    "and": lambda: value & imm,
+                    "or": lambda: value | imm,
+                    "shl": lambda: value << imm,
+                    "shr": lambda: value >> imm,
+                    "sar": lambda: value >> imm,
+                }[ins.mnemonic]()
+            case "cmp" | "test" | "push":
+                pass
+            case _:
+                # Any other instruction writing dst leaves its value unknown.
+                register_constants.pop(dst_reg, None)
         if dst_reg == "rax" and "eax" in register_constants:
             register_constants["rax"] = register_constants["eax"]
         elif dst_reg == "eax" and "eax" in register_constants:
             register_constants["rax"] = register_constants["eax"]
+
+    @staticmethod
+    def __rbp_slot(mem):
+        if (
+            isinstance(mem, MemoryAddress)
+            and mem.base_register is not None
+            and canonical_register(mem.base_register) == "rbp"
+            and mem.index_register is None
+        ):
+            return int(mem.displacement or 0)
+        return None
+
+    def __track_slot_constant(self, ins, register_constants):
+        """Track integer constants stored to and reloaded from rbp-relative slots."""
+        slot = self.__rbp_slot(get_operand_value(ins, ins.operands[0]))
+        if slot is None:
+            return
+        value = None
+        if ins.mnemonic in ("mov", "movabs") and len(ins.operands) >= 2:
+            src = ins.operands[1]
+            if is_immediate(src):
+                value = int(src.imm)
+            elif is_register(src):
+                value = register_constants.get(get_register_name(ins, src))
+        if value is None:
+            self._slot_constants.pop(slot, None)
+        else:
+            self._slot_constants[slot] = value
 
     def __call_function_name(self, call_addr):
         for func in self.cfg.kb.functions.values():

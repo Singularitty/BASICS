@@ -1,6 +1,7 @@
 import angr
 import claripy
 import os
+from contextlib import contextmanager
 
 from src import global_vars
 from src.exceptions import FailedConcolicExecution
@@ -15,6 +16,80 @@ def _rss_mb():
         return rss_pages * _PAGESIZE / (1024 * 1024)
     except Exception:
         return 0.0
+
+
+def _wide_load(state, addr):
+    return state.memory.load(addr, 4, endness="Iend_LE")
+
+
+class _Wcscpy(angr.SimProcedure):
+    """wcscpy for glibc's four-byte wchar_t; angr ships no wide-string procedures."""
+
+    def run(self, dst, src):
+        for index in range(4096):
+            wchar = _wide_load(self.state, src + index * 4)
+            self.state.memory.store(dst + index * 4, wchar, endness="Iend_LE")
+            if self.state.solver.is_true(wchar == 0):
+                break
+        return dst
+
+
+class _Wcscat(angr.SimProcedure):
+    def run(self, dst, src):
+        end = 0
+        while end < 4096 and not self.state.solver.is_true(_wide_load(self.state, dst + end * 4) == 0):
+            end += 1
+        for index in range(4096):
+            wchar = _wide_load(self.state, src + index * 4)
+            self.state.memory.store(dst + (end + index) * 4, wchar, endness="Iend_LE")
+            if self.state.solver.is_true(wchar == 0):
+                break
+        return dst
+
+
+class _Wmemcpy(angr.SimProcedure):
+    """wmemcpy/wmemmove/wcsncpy: copy n wide characters (wcsncpy padding is the same size)."""
+
+    def run(self, dst, src, count):
+        n = min(self.state.solver.max_int(count), 4096)
+        if n:
+            self.state.memory.store(dst, self.state.memory.load(src, n * 4))
+        return dst
+
+
+class _Wmemset(angr.SimProcedure):
+    def run(self, dst, wchar, count):
+        n = min(self.state.solver.max_int(count), 4096)
+        for index in range(n):
+            self.state.memory.store(dst + index * 4, wchar[31:0], endness="Iend_LE")
+        return dst
+
+
+# Library functions whose stack writes matter, executed with real semantics
+# while a call is summarized (they are ReturnUnconstrained stubs otherwise).
+_WRITING_PROCEDURES = {
+    name: angr.SIM_PROCEDURES["libc"][name]
+    for name in (
+        "memcpy", "memmove", "memset", "strcpy", "strncpy", "strcat", "strncat",
+        "sprintf", "snprintf", "vsnprintf", "gets", "fgets", "scanf", "sscanf",
+    )
+    if name in angr.SIM_PROCEDURES["libc"]
+}
+_WRITING_PROCEDURES.update({
+    name: angr.SIM_PROCEDURES["posix"][name] for name in ("read", "recv") if name in angr.SIM_PROCEDURES["posix"]
+})
+_WRITING_PROCEDURES.update({
+    "wcscpy": _Wcscpy, "wcscat": _Wcscat, "wcsncpy": _Wmemcpy,
+    "wmemcpy": _Wmemcpy, "wmemmove": _Wmemcpy, "wmemset": _Wmemset,
+})
+
+
+def _plt_function_name(name):
+    name = name.split("@", 1)[0]
+    for prefix in ("__isoc99_", "__isoc23_"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    return name
 
 
 class ConcolicExecutor:
@@ -101,7 +176,7 @@ class ConcolicExecutor:
     def reaching_state(cls, project, target_addr, start_addr=None, step_limit=None):
         if start_addr is None:
             start_addr = cls.entry_address(project)
-        cache_key = (id(project), start_addr, target_addr)
+        cache_key = (id(project), start_addr, target_addr, cls._hook_fingerprint(project))
         if cache_key in cls._state_cache:
             return cls._state_cache[cache_key].copy()
 
@@ -161,6 +236,105 @@ class ConcolicExecutor:
             f"active={active}, deadended={len(simgr.deadended)}, "
             f"unconstrained={len(simgr.unconstrained)}, errored={len(simgr.errored)}"
         )
+
+    @staticmethod
+    def _hook_fingerprint(project):
+        """States reached under different hooks are not interchangeable."""
+        return frozenset(
+            (addr, type(procedure).__name__)
+            for addr, procedure in project._sim_procedures.items()
+        )
+
+    @staticmethod
+    @contextmanager
+    def real_libc_procedures(project):
+        """Temporarily give writing libc functions real semantics instead of stubs."""
+        replaced = []
+        for name, addr in project.loader.main_object.plt.items():
+            procedure = _WRITING_PROCEDURES.get(_plt_function_name(name))
+            if procedure is None:
+                continue
+            replaced.append((addr, project.hooked_by(addr) if project.is_hooked(addr) else None))
+            project.hook(addr, procedure(), replace=True)
+        try:
+            yield
+        finally:
+            for addr, previous in replaced:
+                project.unhook(addr)
+                if previous is not None:
+                    project.hook(addr, previous)
+
+    @staticmethod
+    def run_call_recording_writes(project, state, return_addr, region_low, region_high, step_limit=None):
+        """
+        Execute the call instruction at ``state`` until it returns to
+        ``return_addr`` and collect every byte address in
+        [region_low, region_high) written by any explored path.
+
+        Returns (written_addresses, returned_state); returned_state is None
+        when no path returned but writes were observed.
+        """
+        written = set()
+
+        def record_write(write_state):
+            address = write_state.inspect.mem_write_address
+            if address is None:
+                return
+            length = write_state.inspect.mem_write_length
+            if length is None:
+                expr = write_state.inspect.mem_write_expr
+                length = expr.length // 8 if expr is not None else 1
+            try:
+                if not isinstance(length, int):
+                    length = write_state.solver.max_int(length)
+                starts = (
+                    [address.concrete_value] if address.concrete
+                    else write_state.solver.eval_upto(address, 16)
+                )
+            except Exception:
+                return
+            for start in starts:
+                for byte_address in range(start, start + max(1, min(int(length), 1 << 16))):
+                    if region_low <= byte_address < region_high:
+                        written.add(byte_address)
+
+        state = state.copy()
+        state.inspect.b("mem_write", when=angr.BP_BEFORE, action=record_write)
+        call_sp = state.solver.eval(state.regs.rsp)
+        if step_limit is None:
+            step_limit = global_vars.CONCOLIC_STEP_LIMIT
+
+        simgr = project.factory.simgr(state)
+        returned = []
+        extra_steps = None
+        for _ in range(step_limit):
+            if not simgr.active:
+                break
+            try:
+                simgr.step()
+            except TypeError as exc:
+                raise FailedConcolicExecution(f"angr failed while stepping: {exc}") from exc
+            still_running = []
+            for active_state in simgr.active:
+                if not active_state.ip.concrete:
+                    continue
+                if active_state.addr == return_addr and active_state.solver.eval(active_state.regs.rsp) == call_sp:
+                    returned.append(active_state)
+                else:
+                    still_running.append(active_state)
+            simgr.stashes["active"] = still_running[:global_vars.CONCOLIC_ACTIVE_LIMIT]
+            # Let sibling paths finish briefly once one path has returned.
+            if returned:
+                extra_steps = 64 if extra_steps is None else extra_steps - 1
+                if extra_steps <= 0:
+                    break
+        if not returned:
+            # A callee that smashes its own return address never comes back;
+            # the writes it made on the way are still what we need.
+            if written:
+                return written, None
+            raise FailedConcolicExecution(f"Call did not return to {hex(return_addr)}")
+        return written, returned[0]
 
     @staticmethod
     def _find_target_state(simgr, target_addr):

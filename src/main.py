@@ -197,8 +197,8 @@ def get_arguments():
     parser.add_argument(
         "--max-iterations",
         type=int,
-        help="Maximum number of iterations for the model checker",
-        default=20,
+        help="Maximum number of loop iterations per path during loop emulation",
+        default=128,
     )
 
     parser.add_argument(
@@ -323,8 +323,9 @@ def get_arguments():
     parser.add_argument(
         "--ltl-backend",
         choices=["spot", "ltl2ba", "auto"],
-        default="auto",
-        help="LTL-to-Buchi backend. spot uses Spot Python bindings; auto falls back to ltl2ba.",
+        default="spot",
+        help="LTL-to-Buchi backend. spot uses the Spot Python bindings or the ltl2tgba CLI; "
+             "ltl2ba is only used when requested explicitly (auto falls back to it).",
     )
 
     parser.add_argument(

@@ -146,7 +146,11 @@ class Evaluator:
                             r = self.eval(expression, {**context, variable: stack, "stack_frame": stack})
                             results.append(r)
                     self.log(f"FORALL_STACK results: {results}")
-                    return None if not results or any(r is None for r in results) else all(results)
+                    # None means the predicate does not apply to that frame
+                    # (e.g. a callee frame that has no saved rbp yet); it must
+                    # not hide a decided result for another frame.
+                    decided = [r for r in results if r is not None]
+                    return all(decided) if decided else None
 
             elif "EXISTS_STACK" in ast:
                 variable = ast["EXISTS_STACK"]["variable"]
@@ -158,20 +162,17 @@ class Evaluator:
                             r = self.eval(expression, {**context, variable: stack, "stack_frame": stack})
                             results.append(r)
                     self.log(f"EXISTS_STACK results: {results}")
-                    if not results:
+                    decided = [r for r in results if r is not None]
+                    if not decided:
                         return None
-                    if any(r is True for r in results):
-                        return True
-                    if any(r is None for r in results):
-                        return None
-                    return False
+                    return any(decided)
 
             elif "FORALL_BUFFER" in ast:
                 stack_var = ast["FORALL_BUFFER"]["stack"]
                 buffer_var = ast["FORALL_BUFFER"]["buffer"]
                 expression = ast["FORALL_BUFFER"]["expression"]
                 if stack_var in context:
-                    stack_frame = self.memory_state.get_stack_frame(context[stack_var])
+                    stack_frame = self.memory_state.lookup_stack_frame(context[stack_var])
                     buffer_ids = stack_frame.get_buffer_ids()
                     results = []
                     for buffer_id in buffer_ids:
@@ -179,14 +180,15 @@ class Evaluator:
                             r = self.eval(expression, {**context, buffer_var: buffer_id})
                             results.append(r)
                     self.log(f"FORALL_BUFFER results: {results}")
-                    return None if not results or any(r is None for r in results) else all(results)
+                    decided = [r for r in results if r is not None]
+                    return all(decided) if decided else None
 
             elif "EXISTS_BUFFER" in ast:
                 stack_var = ast["EXISTS_BUFFER"]["stack"]
                 buffer_var = ast["EXISTS_BUFFER"]["buffer"]
                 expression = ast["EXISTS_BUFFER"]["expression"]
                 if stack_var in context:
-                    stack_frame = self.memory_state.get_stack_frame(context[stack_var])
+                    stack_frame = self.memory_state.lookup_stack_frame(context[stack_var])
                     buffer_ids = stack_frame.get_buffer_ids()
                     results = []
                     for buffer_id in buffer_ids:
@@ -195,13 +197,10 @@ class Evaluator:
                         r = self.eval(expression, {**context, buffer_var: buffer_id})
                         results.append(r)
                     self.log(f"EXISTS_BUFFER results: {results}")
-                    if not results:
+                    decided = [r for r in results if r is not None]
+                    if not decided:
                         return None
-                    if any(r is True for r in results):
-                        return True
-                    if any(r is None for r in results):
-                        return None
-                    return False
+                    return any(decided)
         return None
 
     # Functions used inside evaluation
@@ -209,7 +208,7 @@ class Evaluator:
     def stack(self, stack_id: str) -> StackFrame:
         if not isinstance(stack_id, str):
             raise InvalidLTLFormulaException("Invalid stack id in Stack()")
-        frame = self.memory_state.get_stack_frame(stack_id)
+        frame = self.memory_state.lookup_stack_frame(stack_id)
         self.log(f"stack({stack_id}) = {frame}")
         return frame
 
@@ -219,7 +218,7 @@ class Evaluator:
         if not isinstance(stack_frame, StackFrame):
             if not isinstance(stack_frame, str):
                 raise InvalidLTLFormulaException("Invalid stack frame in Byte()")
-            stack_frame = self.memory_state.get_stack_frame(stack_frame)
+            stack_frame = self.memory_state.lookup_stack_frame(stack_frame)
         value = stack_frame.get_byte_state(offset)
         self.log(f"byte({stack_frame}, {offset}) = {value}")
         return value
@@ -235,9 +234,7 @@ class Evaluator:
     def buffer(self, stack_frame, buffer_id: str) -> List[int]:
         if not isinstance(buffer_id, int):
             raise InvalidLTLFormulaException("Invalid buffer id in Buffer()")
-        stack_frame = self.memory_state.get_stack_frame(stack_frame)
-        if not isinstance(stack_frame, StackFrame):
-            raise InvalidLTLFormulaException("Invalid stack frame in Buffer()")
+        stack_frame = self.__coerce_stack_frame(stack_frame)
         result = (stack_frame.get_buffer(buffer_id), buffer_id)
         self.log(f"buffer({stack_frame}, {buffer_id}) = {result}")
         return result
@@ -266,7 +263,7 @@ class Evaluator:
         return result
 
     def has_canary(self, stack_frame: StackFrame) -> bool:
-        s = self.memory_state.get_stack_frame(stack_frame)
+        s = self.memory_state.lookup_stack_frame(stack_frame)
         result = False if s.canary_written is None else s.canary_written
         self.log(f"has_canary({stack_frame}) = {result}")
         return result
@@ -343,7 +340,7 @@ class Evaluator:
         if isinstance(stack_frame, StackFrame):
             return stack_frame
         if isinstance(stack_frame, str):
-            return self.memory_state.get_stack_frame(stack_frame)
+            return self.memory_state.lookup_stack_frame(stack_frame)
         raise InvalidLTLFormulaException("Invalid stack frame")
 
     def __normalize_range(self, start: int, end: int):

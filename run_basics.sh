@@ -83,23 +83,18 @@ if [ ! -f "$STAMP_FILE" ] || [ "$REQUIREMENTS_FILE" -nt "$STAMP_FILE" ]; then
     date -u +"%Y-%m-%dT%H:%M:%SZ" > "$STAMP_FILE"
 fi
 
-LTL_BACKEND_RUNTIME="auto"
-if python -c "import spot" >/dev/null 2>&1; then
-    LTL_BACKEND_RUNTIME="spot"
-elif command -v ltl2tgba >/dev/null 2>&1; then
-    LTL_BACKEND_RUNTIME="spot"
-elif command -v ltl2ba >/dev/null 2>&1; then
-    LTL_BACKEND_RUNTIME="ltl2ba"
-fi
+# Spot translates the LTL properties. ltl2ba is only used when explicitly
+# requested with BASICS_LTL_BACKEND=ltl2ba.
+LTL_BACKEND_RUNTIME="${BASICS_LTL_BACKEND:-spot}"
 EXTRA_ARGS=()
-if [ "$LTL_BACKEND_RUNTIME" = "auto" ] && ! python -c "import spot" >/dev/null 2>&1 && ! command -v ltl2tgba >/dev/null 2>&1 && ! command -v ltl2ba >/dev/null 2>&1; then
+if [ "$LTL_BACKEND_RUNTIME" = "spot" ] && ! python -c "import spot" >/dev/null 2>&1 && ! command -v ltl2tgba >/dev/null 2>&1; then
     if ls "$ROOT_DIR"/security_properties/buchi_automata/*.pickle >/dev/null 2>&1; then
-        echo "No Spot/ltl2ba backend found. Reusing cached Buchi automata pickles."
+        echo "Spot not found. Reusing cached Buchi automata pickles (built with Spot)."
         EXTRA_ARGS+=(--no-recompilation-ltl)
     else
         cat >&2 <<EOF
-No LTL translator backend found.
-Install Spot (preferred) or ltl2ba, for example with ./install.sh.
+Spot is required to translate the LTL properties.
+Install it, for example with ./install.sh.
 EOF
         exit 1
     fi

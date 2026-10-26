@@ -155,6 +155,22 @@ class IndexedWriteOperation(WriteOperation):
         self.scale = scale if scale is not None else 1
 
 
+class PointerWriteOperation(MemoryOperation):
+    """
+    Represents a store through a general-purpose register, e.g. [rax + 0x8] or
+    [rax + rdx * 1].  Whether it reaches the stack, and which stack frame, is
+    only known once the base register is resolved to a stack address.
+    """
+
+    def __init__(self, base_register, displacement, index_register, scale, data_size: int) -> None:
+        super().__init__(OperationType.WRITE)
+        self.base_register = base_register
+        self.displacement = displacement
+        self.index_register = index_register
+        self.scale = scale if scale is not None else 1
+        self.data_size = data_size
+
+
 class BufferAllocation(MemoryOperation):
     """
     Represents a buffer allocation operation that was performed on the stack.
@@ -264,6 +280,20 @@ class MemoryTransition:
                                     return IndexedWriteOperation(offset, index_register, scale, reg_name, source.type, instruction.op_str)
                                 elif instruction.operands[1].type == X86_OP_IMM:
                                     return IndexedWriteOperation(offset, index_register, scale, address, X86_OP_IMM, instruction.op_str)
+                            elif (
+                                mnemonic == "mov"
+                                and address.segment == 0
+                                and instruction.reg_name(address.base) not in (None, "rsp", "rip")
+                                and instruction.operands[1].type in (X86_OP_REG, X86_OP_IMM)
+                            ):
+                                # Store through a pointer register; resolved by the state-space constructor.
+                                return PointerWriteOperation(
+                                    instruction.reg_name(address.base),
+                                    address.disp,
+                                    instruction.reg_name(address.index),
+                                    address.scale,
+                                    instruction.operands[0].size,
+                                )
                             else:
                                 return None
                         # If the second operand is a memory address, a read from memory operation is performed

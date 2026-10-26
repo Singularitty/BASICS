@@ -49,6 +49,9 @@ zlib headers and, optionally, Spot, then run `./install.sh --skip-system`.
 `PYTHON_BIN=python3.11 ./run_basics.sh --help`. Without E9Patch (`e9tool` on
 `PATH`), it falls back to analysis-only mode.
 
+For LTL translation BASICS uses Spot; `ltl2ba` is only used when requested
+explicitly with `BASICS_LTL_BACKEND=ltl2ba` (or `--ltl-backend ltl2ba`).
+
 ## Run BASICS
 
 Build the small C fixtures and run one binary:

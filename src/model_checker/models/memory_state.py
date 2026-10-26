@@ -45,6 +45,17 @@ class MemoryState:
         """
         return self.stack_frames_map[function_name]
 
+    def lookup_stack_frame(self, function_name):
+        """
+        Returns the stack frame of the given function name without copying it.
+        Unlike get_stack_frame, an unknown name raises instead of adding a frame,
+        so read-only callers (the property evaluator) cannot change the state.
+        """
+        try:
+            return self.stack_frames_map[function_name]
+        except KeyError as e:
+            raise NonExistentStackFrame(f"No stack frame named {function_name}") from e
+
     def get_stack_frame(self, function_name):
         """
         Returns a copy of the stack frame of the given function name.

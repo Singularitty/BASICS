@@ -338,6 +338,11 @@ class LinearTemporalLogicTranslator:
     def load_automata(self, key: str):
         with open(os.path.join(self.directory + "/buchi_automata/", f"{key}.pickle"), 'rb') as f:
             automata = pickle.load(f)
+        # Rebuild each edge's AST from its stored condition text so the cached
+        # automata always follow the current proposition grammar.
+        for condition in automata.edges():
+            tree = self.propositions_parser.parse(condition.string)
+            condition.ast = LogicTransformer().transform(tree)
         return automata
     
     def load_all_automata(self):

@@ -33,7 +33,7 @@ LOOP_SIMULATION = "concolic-static"
 USER_CALL_SIMULATION = "concolic"
 CONCOLIC_STEP_LIMIT = 10000
 CONCOLIC_ACTIVE_LIMIT = 64
-LTL_BACKEND = "auto"
+LTL_BACKEND = "spot"
 ANALYSIS_START_ADDR = None
 SCAN_MEMORY_LIMIT_MB = None  # RSS ceiling per function in scan mode; None = unlimited
 MEMORY_LIMIT_MB = None  # RSS ceiling for normal whole-binary analysis; None = unlimited

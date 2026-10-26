@@ -1,4 +1,4 @@
-[]($exists_stack x: has_canary(x)$  -> ($exists_stack x: (has_canary(x) && (byte(stack(x), 23) = Critical && 
+[]($exists_stack x: has_canary(x)$  -> ($forall_stack x: (!has_canary(x) || (byte(stack(x), 23) = Critical && 
                                             byte(stack(x), 16) = Critical && 
                                             byte(stack(x), 17) = Critical && 
                                             byte(stack(x), 18) = Critical && 
