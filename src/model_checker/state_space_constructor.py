@@ -71,6 +71,11 @@ def _clib_name_for_plt(plt_name, clib_names):
     return None
 
 
+# Argument registers whose constants/bounds are passed to a callee (32- and 64-bit names).
+_ARGUMENT_FACT_REGISTERS = ("rdi", "edi", "rsi", "esi", "rdx", "edx", "rcx", "ecx", "r8", "r8d", "r9", "r9d")
+_CALL_ARGUMENTS_KEY = "@call_arguments"
+
+
 class StateSpaceConstructor:
 
     def __init__(self, binary_data: BinaryDataExtractor, binary_name, current_dir, binary_path, max_iter, max_states=None, max_recursion_depth=1) -> None:
@@ -90,7 +95,6 @@ class StateSpaceConstructor:
         self.max_states = max_states
         self.max_recursion_depth = max_recursion_depth
         self._dwarf_buffers = self.__load_dwarf_stack_buffers()
-        self._dwarf_runtime_bias = {}
         self._hook_all_clib_plt()
         # Block-address → function-entry-address map, used to check whether a
         # fall-through address belongs to the same function as its predecessor.
@@ -193,7 +197,7 @@ class StateSpaceConstructor:
                 break
 
             if current_node.name is not None and self.__is_in_loop(current_node) and self.max_iter > 0:
-                current_state = self.__process_loop(current_node, current_state)
+                current_state = self.__process_loop(current_node, current_state, pointer_facts)
 
             # Get successors
             successors = self.__get_successors(current_node)
@@ -272,7 +276,7 @@ class StateSpaceConstructor:
                 self.__track_pointer_facts(ins, function_name, pointer_facts)
         return current_state, local_constants, register_constants, local_bounds, register_bounds, pointer_facts
 
-    def __process_loop(self, node, current_state) -> MemoryState:
+    def __process_loop(self, node, current_state, pointer_facts=None) -> MemoryState:
         if not global_vars.SCAN_MODE:
             print("Loop detected.\nPerforming loop emulation...")
         fname = self.__function_name_for_node(node)
@@ -283,16 +287,16 @@ class StateSpaceConstructor:
             return current_state
         if global_vars.LOOP_SIMULATION == "static":
             difs = self.__static_loop_stack_write_indices(loop, current_state, fname, node)
-            return self.__apply_loop_stack_writes(node, current_state, fname, difs)
+            return self.__apply_loop_stack_writes(node, current_state, {fname: difs})
         try:
-            fname, difs = self.__loop_emulator(node, current_state)
+            fname, difs = self.__loop_emulator(node, current_state, pointer_facts)
         except FailedConcolicExecution as exc:
             print(f"Failed to execute loop: {exc}" if global_vars.DEBUG else "Failed to execute loop.")
             print("Retrying without function hooks...")
             for addr in GLOBAL_HOOKS:
                 self.project.unhook(addr)
             try:
-                fname, difs = self.__loop_emulator(node, current_state)
+                fname, difs = self.__loop_emulator(node, current_state, pointer_facts)
                 print("Loop emulation successful.")
             except FailedConcolicExecution as exc:
                 print(
@@ -300,10 +304,10 @@ class StateSpaceConstructor:
                     if global_vars.DEBUG else
                     "Failed to execute loop. Skipping loop emulation."
                 )
-                difs = self.__loop_fallback_indices(loop, current_state, fname, node)
+                difs = {fname: self.__loop_fallback_indices(loop, current_state, fname, node)}
             except FailedLoopUnrolling:
                 print("Failed to unroll loop. Skipping loop emulation.")
-                difs = self.__loop_fallback_indices(loop, current_state, fname, node)
+                difs = {fname: self.__loop_fallback_indices(loop, current_state, fname, node)}
             finally:
                 ret_unc = angr.SIM_PROCEDURES["stubs"]["ReturnUnconstrained"]
                 for addr in GLOBAL_HOOKS:
@@ -311,8 +315,8 @@ class StateSpaceConstructor:
                         self.project.hook(addr, ret_unc())
         except FailedLoopUnrolling:
             print("Failed to unroll loop. Skipping loop emulation.")
-            difs = self.__loop_fallback_indices(loop, current_state, fname, node)
-        return self.__apply_loop_stack_writes(node, current_state, fname, difs)
+            difs = {fname: self.__loop_fallback_indices(loop, current_state, fname, node)}
+        return self.__apply_loop_stack_writes(node, current_state, difs)
 
     def __loop_fallback_indices(self, loop, current_state, function_name, loop_node):
         if global_vars.LOOP_SIMULATION != "concolic-static":
@@ -321,17 +325,21 @@ class StateSpaceConstructor:
             loop, current_state, function_name, loop_node
         )
 
-    def __apply_loop_stack_writes(self, node, current_state, function_name, difs):
-        if len(difs) > 0:
-            old_frame = current_state.get_stack_frame(function_name)
-            new_frame = old_frame.write_multiple_bytes(difs)
-            next_state = current_state.add_stack_frame(function_name, new_frame)
-            jump_ins = self.__get_any_node(node.addr).block.capstone.insns[-1]
-            next_state = next_state.add_instruction(jump_ins)
-            self.state_space.add_state(next_state)
-            self.state_space.add_transition(current_state, next_state, MemoryTransition(jump_ins, self.cfg))
-            return next_state
-        return current_state
+    def __apply_loop_stack_writes(self, node, current_state, frame_writes):
+        """Apply {frame name: byte indices} written by a loop.  The frame can be
+        a caller's when the loop writes through a pointer into its buffer."""
+        next_state = current_state
+        for frame_name, difs in frame_writes.items():
+            if difs and next_state.contains_stack_frame(frame_name):
+                old_frame = next_state.get_stack_frame(frame_name)
+                next_state = next_state.add_stack_frame(frame_name, old_frame.write_multiple_bytes(difs))
+        if next_state is current_state:
+            return current_state
+        jump_ins = self.__get_any_node(node.addr).block.capstone.insns[-1]
+        next_state = next_state.add_instruction(jump_ins)
+        self.state_space.add_state(next_state)
+        self.state_space.add_transition(current_state, next_state, MemoryTransition(jump_ins, self.cfg))
+        return next_state
 
     def __function_name_for_node(self, node):
         try:
@@ -547,7 +555,8 @@ class StateSpaceConstructor:
                                             path_blocks=self._current_path,
                                             pointer_destinations={
                                                 reg: destination[1:] for reg, destination in pointer_destinations.items()
-                                            })
+                                            },
+                                            entry_string_lengths=self.__entry_string_lengths(function_name, pointer_facts))
                         stack_changes = call.stack_changes
                         # The destination may be a caller's buffer reached through a pointer argument.
                         written_frame = function_name
@@ -565,12 +574,15 @@ class StateSpaceConstructor:
                             next_state = current_state.add_stack_frame(written_frame, new_frame)
                             next_state = next_state.add_instruction(ins)
                     elif any(x.name == call_name for x in self.user_functions) and not current_state.contains_stack_frame(call_name):
+                        if pointer_facts is not None:
+                            self.__record_entry_string_lengths(ins, node, function_name, call_name, current_state, pointer_facts)
                         if global_vars.USER_CALL_SIMULATION == "concolic":
                             current_state = self.__summarize_user_call(
                                 ins, function_name, node, current_state
                             )
                         new_frame = StackFrame()
                         new_frame.initialize()
+                        self.__apply_dwarf_buffers(new_frame, call_name)
                         next_state = current_state.add_stack_frame(call_name, new_frame)
                         next_state = next_state.add_instruction(ins)
                     elif any(x.name == call_name for x in self.user_functions) and current_state.contains_stack_frame(call_name):
@@ -1073,6 +1085,43 @@ class StateSpaceConstructor:
         else:
             pointer_facts.pop(dst_reg, None)
 
+    @staticmethod
+    def __entry_string_lengths(function_name, pointer_facts):
+        """String lengths of function_name's arguments recorded at its call site."""
+        if not pointer_facts:
+            return {}
+        return {
+            key[2]: length for key, length in pointer_facts.items()
+            if isinstance(key, tuple) and len(key) == 3 and key[0] == "strlen" and key[1] == function_name
+        }
+
+    def __record_entry_string_lengths(self, ins, node, function_name, call_name, current_state, pointer_facts):
+        """
+        At a call to a user function, remember the string lengths of the
+        arguments as the caller knows them (e.g. after memset(data,'A',49);
+        data[49]=0), so the callee's library calls can use them.
+        """
+        for key in [key for key in pointer_facts if isinstance(key, tuple) and key[:2] == ("strlen", call_name)]:
+            pointer_facts.pop(key)
+        try:
+            analysis = CallEmulator(
+                current_state.get_stack_frame(function_name),
+                ins,
+                node,
+                self.cfg,
+                self.project,
+                self.user_functions,
+                self.binary_path,
+                concolic_exection=False,
+                path_blocks=self._current_path,
+                entry_string_lengths=self.__entry_string_lengths(function_name, pointer_facts),
+            )
+            lengths = analysis.argument_string_lengths()
+        except Exception:
+            return
+        for register_name, length in lengths.items():
+            pointer_facts[("strlen", call_name, register_name)] = length
+
     def __pointer_facts_for_successor(self, node, successor, pointer_facts):
         succ_pointers = pointer_facts.copy()
         insns = node.block.capstone.insns if not node.is_simprocedure and node.block is not None else []
@@ -1085,6 +1134,12 @@ class StateSpaceConstructor:
 
     def __track_simple_facts(self, ins, local_constants, register_constants, local_bounds, register_bounds):
         if ins.mnemonic == "call":
+            # The callee receives the argument registers; keep their facts for
+            # the call edge (__facts_for_successor) before they are clobbered.
+            for facts in (register_constants, register_bounds):
+                facts[_CALL_ARGUMENTS_KEY] = tuple(
+                    (reg, facts[reg]) for reg in _ARGUMENT_FACT_REGISTERS if reg in facts
+                )
             for reg in ("rdi", "rsi", "rdx", "rcx", "r8", "r9"):
                 slot = register_constants.pop("&" + reg, None)
                 if slot is not None:
@@ -1160,8 +1215,9 @@ class StateSpaceConstructor:
                         register_bounds,
                         ("rax", "eax", "ax", "al", "rcx", "ecx", "rdx", "edx", "rsi", "esi", "rdi", "edi"),
                     )
-                if ins.mnemonic in ("cdqe", "cltq") and "eax" in register_bounds:
-                    register_bounds["rax"] = register_bounds["eax"]
+                if ins.mnemonic in ("cdqe", "cltq"):
+                    # rax = sign-extended eax
+                    self.__sync_register_alias("eax", register_constants, register_bounds)
                 return
             # cmp/test only read their operands
             if ins.mnemonic in ("cmp", "test"):
@@ -1170,6 +1226,7 @@ class StateSpaceConstructor:
                 dst_reg = ins.reg_name(ins.operands[0].reg)
                 register_constants.pop(dst_reg, None)
                 register_bounds.pop(dst_reg, None)
+                self.__sync_register_alias(dst_reg, register_constants, register_bounds)
             elif ins.operands[0].type == X86_OP_MEM and ins.reg_name(ins.operands[0].mem.base) == "rbp":
                 # e.g. the loop increment `add DWORD PTR [rbp-0x4], 0x1`
                 slot = ins.operands[0].mem.disp
@@ -1178,6 +1235,17 @@ class StateSpaceConstructor:
             return
 
         dst, src = ins.operands[0], ins.operands[1]
+        if dst.type == X86_OP_MEM and ins.reg_name(dst.value.mem.base) == "rip" and dst.value.mem.index == 0:
+            # globalData = data: globals keep their facts across calls
+            key = ("global", ins.address + ins.size + dst.value.mem.disp)
+            value = int(src.imm) if src.type == X86_OP_IMM else register_constants.get(ins.reg_name(src.reg)) if src.type == X86_OP_REG else None
+            bounds = (value, value) if value is not None else register_bounds.get(ins.reg_name(src.reg)) if src.type == X86_OP_REG else None
+            for facts, fact in ((local_constants, value), (local_bounds, bounds)):
+                if fact is None:
+                    facts.pop(key, None)
+                else:
+                    facts[key] = fact
+            return
         if dst.type == X86_OP_MEM:
             mem = dst.value.mem
             if ins.reg_name(mem.base) == "rbp" and mem.index == 0:
@@ -1220,6 +1288,13 @@ class StateSpaceConstructor:
                 register_bounds.pop(dst_reg, None)
             else:
                 register_bounds[dst_reg] = bounds
+        elif src.type == X86_OP_MEM and ins.reg_name(src.value.mem.base) == "rip" and src.value.mem.index == 0:
+            key = ("global", ins.address + ins.size + src.value.mem.disp)
+            for facts, source in ((register_constants, local_constants), (register_bounds, local_bounds)):
+                if key in source:
+                    facts[dst_reg] = source[key]
+                else:
+                    facts.pop(dst_reg, None)
         elif src.type == X86_OP_MEM:
             mem = src.value.mem
             if ins.reg_name(mem.base) == "rbp" and mem.index == 0 and mem.disp in local_constants:
@@ -1234,10 +1309,7 @@ class StateSpaceConstructor:
             register_constants.pop(dst_reg, None)
             register_bounds.pop(dst_reg, None)
 
-        if dst_reg == "eax" and "eax" in register_constants:
-            register_constants["rax"] = register_constants["eax"]
-        if dst_reg == "eax" and "eax" in register_bounds:
-            register_bounds["rax"] = register_bounds["eax"]
+        self.__sync_register_alias(dst_reg, register_constants, register_bounds)
 
     def __track_constant_facts(self, ins, register_constants):
         """
@@ -1295,15 +1367,29 @@ class StateSpaceConstructor:
             return self._constant_return_cache[function_addr]
         value = None
         func = self.cfg.kb.functions.function(addr=function_addr)
-        if func is not None and len(func.block_addrs) == 1:
+        if func is not None:
             try:
-                insns = self.project.factory.block(function_addr).capstone.insns
+                insns = [
+                    ins
+                    for block_addr in sorted(func.block_addrs)
+                    for ins in self.project.factory.block(block_addr).capstone.insns
+                ]
             except Exception:
                 insns = []
-            if insns and insns[-1].mnemonic == "ret" and not any(ins.mnemonic == "call" for ins in insns):
-                for ins in insns:
-                    if len(ins.operands) == 2 and ins.operands[0].type == X86_OP_REG and ins.reg_name(ins.operands[0].reg) in ("eax", "rax"):
-                        value = int(ins.operands[1].imm) if ins.mnemonic == "mov" and ins.operands[1].type == X86_OP_IMM else None
+            straight_line = (
+                insns
+                and insns[-1].mnemonic == "ret"
+                and not any(ins.mnemonic == "call" or ins.mnemonic.startswith("j") for ins in insns)
+            )
+            if straight_line:
+                # Evaluate the helper with the same fact tracker, e.g.
+                # `int goodSource(int data) { data = 7; return data; }`.
+                local_constants, register_constants, local_bounds, register_bounds = {}, {}, {}, {}
+                for ins in insns[:-1]:
+                    self.__track_simple_facts(ins, local_constants, register_constants, local_bounds, register_bounds)
+                value = register_constants.get("eax", register_constants.get("rax"))
+                if not isinstance(value, int):
+                    value = None
         self._constant_return_cache[function_addr] = value
         return value
 
@@ -1394,6 +1480,24 @@ class StateSpaceConstructor:
             return taken
         return False
 
+    @staticmethod
+    def __sync_register_alias(dst_reg, register_constants, register_bounds):
+        """A write to a 32-bit register also defines (or invalidates) its 64-bit alias."""
+        wide = _REGISTER_64.get(dst_reg, dst_reg)
+        if wide == dst_reg:
+            return
+        # Only a 32-bit write defines the whole register (zero/sign-extended);
+        # 8/16-bit writes leave the upper bits, so the alias becomes unknown.
+        full_width = dst_reg.startswith("e") or dst_reg.endswith("d")
+        for facts in (register_constants, register_bounds):
+            if dst_reg in facts and full_width:
+                value = facts[dst_reg]
+                if isinstance(value, int):
+                    value = value - 2**32 if 2**31 <= value < 2**32 else value
+                facts[wide] = value
+            else:
+                facts.pop(wide, None)
+
     def __clear_register_facts(self, register_constants, register_bounds, regs):
         for reg in regs:
             register_constants.pop(reg, None)
@@ -1451,9 +1555,10 @@ class StateSpaceConstructor:
         return stores
 
     def __facts_key(self, local_bounds, register_bounds):
+        # Keys mix slot offsets, register names and ("global", addr) tuples.
         return (
-            tuple(sorted(local_bounds.items())),
-            tuple(sorted(register_bounds.items())),
+            tuple(sorted(local_bounds.items(), key=repr)),
+            tuple(sorted(register_bounds.items(), key=repr)),
         )
 
     def __facts_for_successor(self, node, successor, local_constants, register_constants, local_bounds, register_bounds):
@@ -1461,6 +1566,18 @@ class StateSpaceConstructor:
         succ_regs = register_constants.copy()
         succ_local_bounds = local_bounds.copy()
         succ_reg_bounds = register_bounds.copy()
+        insns = node.block.capstone.insns if not node.is_simprocedure and node.block is not None else []
+        entering_callee = bool(insns) and insns[-1].mnemonic == "call" and successor.addr != node.addr + node.size
+        for facts in (succ_regs, succ_reg_bounds):
+            arguments = facts.pop(_CALL_ARGUMENTS_KEY, ())
+            if entering_callee:
+                # Only the arguments carry over; the callee starts with no
+                # knowledge of the caller's locals.
+                facts.clear()
+                facts.update(arguments)
+        if entering_callee:
+            succ_locals = {key: value for key, value in succ_locals.items() if isinstance(key, tuple) and key[0] == "global"}
+            succ_local_bounds = {key: value for key, value in succ_local_bounds.items() if isinstance(key, tuple) and key[0] == "global"}
         self.__apply_branch_bounds(node, successor, succ_local_bounds, succ_reg_bounds)
         return succ_locals, succ_regs, succ_local_bounds, succ_reg_bounds
 
@@ -1641,7 +1758,7 @@ class StateSpaceConstructor:
                     continue
         return False
 
-    def __loop_emulator(self, node, state, max_iterations=20) -> (str, list[int]):
+    def __loop_emulator(self, node, state, pointer_facts=None) -> (str, dict):
         function_name = node.name.split("+")[0]
 
         loop = next(filter(lambda l: l.continue_edges[0][0].addr == node.addr, self.loops), None)
@@ -1674,25 +1791,64 @@ class StateSpaceConstructor:
         stack_pointer = pre_loop_state.regs.rsp
         concrete_sp = pre_loop_state.solver.eval(stack_pointer)
         observed_writes_by_instruction = {}
+        concrete_rbp = pre_loop_state.solver.eval(pre_loop_state.regs.rbp)
+        memory_objects = self.__loop_memory_objects(
+            function_name, entry_addr, pre_loop_state, concrete_rbp, state, pointer_facts or {}
+        )
+        out_of_bounds_writes = []
 
         def record_stack_write(write_state):
             try:
-                address = write_state.solver.eval(write_state.inspect.mem_write_address)
+                address_expr = write_state.inspect.mem_write_address
+                address = write_state.solver.eval(address_expr)
                 length_expr = write_state.inspect.mem_write_length
                 length = write_state.solver.eval(length_expr) if length_expr is not None else 1
             except Exception:
                 return
+            length = max(1, int(length))
             instruction_writes = observed_writes_by_instruction.setdefault(write_state.addr, set())
-            for byte_address in range(address, address + max(1, int(length))):
+            for byte_address in range(address, address + length):
                 instruction_writes.add(byte_address)
+            if not memory_objects:
+                return
+            try:
+                # VEX guards some stores (e.g. the iteration of `rep stos` that
+                # runs with rcx == 0); a store that may not happen proves nothing.
+                condition = write_state.inspect.mem_write_condition
+                if condition is not None and not write_state.solver.is_true(condition):
+                    return
+                determined = not getattr(address_expr, "symbolic", False) or write_state.solver.unique(address_expr)
+            except Exception:
+                determined = False
+            if not determined:
+                # A store whose address the path does not fix only shows that
+                # some address is possible, not where this store lands.
+                return
+            # Previous store of the same instruction on this path.  globals are
+            # copied shallowly with the state, so the map is replaced, not mutated.
+            last_writes = write_state.globals.get("loop_last_writes", {})
+            previous = last_writes.get(write_state.addr)
+            violation = self.__loop_write_leaves_object(memory_objects, address, length, previous)
+            if violation is not None:
+                # angr keeps executing a block's statements on the fall-through
+                # of an exit that is always taken (e.g. `rep stos` once rcx is
+                # 0); such a store belongs to an infeasible path.
+                try:
+                    feasible = write_state.solver.satisfiable()
+                except Exception:
+                    feasible = False
+                if feasible:
+                    out_of_bounds_writes.append((write_state.addr, address, length, violation))
+            stride = address - previous[0] if previous is not None else None
+            last_writes = dict(last_writes)
+            last_writes[write_state.addr] = (address, length, stride)
+            write_state.globals["loop_last_writes"] = last_writes
 
         pre_loop_state.inspect.b(
             "mem_write",
             when=angr.BP_BEFORE,
             action=record_stack_write,
         )
-
-        stack_memory_before = pre_loop_state.solver.eval(pre_loop_state.memory.load(stack_pointer, current_stack_frame.get_stack_size()), cast_to=bytes)
 
         simgr = loop_project.factory.simgr(pre_loop_state)
         pre_loop_state.globals["loop_iterations"] = 0
@@ -1705,6 +1861,11 @@ class StateSpaceConstructor:
 
             if len(simgr.active) == 0:
                 if simgr.stashes.get("bounded"):
+                    break
+                if out_of_bounds_writes:
+                    # A proven out-of-bounds store can corrupt the loop's own
+                    # control data (counter, pointer, return address), so the
+                    # loop not finishing does not invalidate the observed store.
                     break
                 raise FailedLoopUnrolling("No active states left to execute. The loop may not have executed properly.")
 
@@ -1727,86 +1888,195 @@ class StateSpaceConstructor:
 
         post_loop_state = next((s for s in simgr.active if s.addr == exit_addr), None)
 
-        if post_loop_state is None:
+        # Raw byte differences are not projected into the abstract frame: a
+        # CFG node can be revisited with a partially constructed frame, and
+        # ordinary locals near rbp (especially the loop counter) can then be
+        # mistaken for saved frame metadata.  Only proven out-of-bounds stores
+        # are modelled, as a whole-frame write of the frame owning the object
+        # (the same policy as the static libc and pointer-store models); stores
+        # that stay inside known objects or touch only other locals are not.
+        frame_writes = {}
+        for ins_addr, address, length, (owner, object_start, object_end) in out_of_bounds_writes:
+            if owner in frame_writes:
+                continue
+            owner_frame = state.get_stack_frame(owner)
+            if global_vars.DEBUG:
+                print(
+                    f"Proven loop out-of-bounds store at {hex(ins_addr)}: "
+                    f"[{hex(address)},{hex(address + length)}) leaves object "
+                    f"[{hex(object_start)},{hex(object_end)}) of frame {owner}; "
+                    "marking the stack-overflow state."
+                )
+            frame_writes[owner] = list(range(owner_frame.get_stack_size()))
+
+        if post_loop_state is None and not frame_writes:
             print(f"Could not find target address {hex(exit_addr)} after executing loop at {hex(entry_addr)}\nSkipping loop emulation\nMaybe try to increase the maximum number of iterations with the --max-iterations flag. (default is 128)\n")
-            return function_name, []
+            return function_name, {}
 
-        stack_memory_after = post_loop_state.solver.eval(post_loop_state.memory.load(stack_pointer, current_stack_frame.get_stack_size()), cast_to=bytes)
-
-        # Loop vulnerability classification is based on the explicit
-        # dynamic-allocation and DWARF-buffer boundary proofs below.  Raw byte
-        # differences are not projected into the abstract frame: a CFG node can
-        # be revisited with a partially constructed frame, and ordinary locals
-        # near rbp (especially the loop counter) can then be mistaken for saved
-        # frame metadata.  The observed addresses still preserve zero-to-zero
-        # writes and are used by both precise boundary checks.
-        difs = []
         frame_limit = concrete_sp + current_stack_frame.get_stack_size()
-        for instruction_addr, allocation_size in self._dynamic_write_allocations.items():
-            writes = {
-                address for address in observed_writes_by_instruction.get(instruction_addr, ())
-                if concrete_sp <= address < frame_limit
-            }
-            if writes and max(writes) - min(writes) + 1 > allocation_size:
-                if global_vars.DEBUG:
-                    print(
-                        f"Proven loop overflow of dynamic allocation size={allocation_size} "
-                        f"at {hex(instruction_addr)}."
-                    )
-                difs = list(range(current_stack_frame.get_stack_size()))
-                break
-        concrete_rbp = pre_loop_state.solver.eval(pre_loop_state.regs.rbp)
-        for writes in observed_writes_by_instruction.values():
-            if not writes:
-                continue
-            write_min, write_max = min(writes), max(writes)
-            if write_max - write_min + 1 != len(writes):
-                continue
-            for offset, size in self._dwarf_buffers.get(function_name, ()):
-                if len(writes) != int(size):
-                    continue
-                bias = write_min - (concrete_rbp + int(offset))
-                if abs(bias) <= 32:
-                    self._dwarf_runtime_bias[function_name] = bias
-                    break
-        dwarf_bias = self._dwarf_runtime_bias.get(function_name, 0)
-        for offset, size in self._dwarf_buffers.get(function_name, ()):
-            start = concrete_rbp + int(offset) + dwarf_bias
-            end = start + int(size)
-            boundary_width = min(8, int(size))
-            crosses_upper_boundary = any(
-                all(address in writes for address in range(end - boundary_width, end + boundary_width))
-                for writes in observed_writes_by_instruction.values()
-            )
-            crosses_lower_boundary = any(
-                all(address in writes for address in range(start - boundary_width, start + boundary_width))
-                for writes in observed_writes_by_instruction.values()
-            )
-            if crosses_upper_boundary or crosses_lower_boundary:
-                if global_vars.DEBUG:
-                    crossing = [
-                        (hex(ins_addr), min(writes), max(writes), len(writes))
-                        for ins_addr, writes in observed_writes_by_instruction.items()
-                        if (
-                            all(address in writes for address in range(end - boundary_width, end + boundary_width))
-                            or all(address in writes for address in range(start - boundary_width, start + boundary_width))
+        if function_name not in frame_writes:
+            for instruction_addr, allocation_size in self._dynamic_write_allocations.items():
+                writes = {
+                    address for address in observed_writes_by_instruction.get(instruction_addr, ())
+                    if concrete_sp <= address < frame_limit
+                }
+                if writes and max(writes) - min(writes) + 1 > allocation_size:
+                    if global_vars.DEBUG:
+                        print(
+                            f"Proven loop overflow of dynamic allocation size={allocation_size} "
+                            f"at {hex(instruction_addr)}."
                         )
-                    ]
-                    print(
-                        f"Proven loop overflow of DWARF buffer offset={offset} size={size}; "
-                        f"buffer_range=({start},{end}); crossing={crossing}; "
-                        "marking the stack-overflow state."
-                    )
-                difs = list(range(current_stack_frame.get_stack_size()))
-                break
+                    frame_writes[function_name] = list(range(current_stack_frame.get_stack_size()))
+                    break
         if global_vars.DEBUG:
             print(
-                f"Loop stack differences: count={len(difs)} "
-                f"range={((min(difs), max(difs)) if difs else None)} "
+                f"Loop stack writes: frames={ {name: len(difs) for name, difs in frame_writes.items()} } "
+                f"objects={[(owner, hex(start), end - start) for owner, start, end in memory_objects]} "
                 f"buffers={current_stack_frame.buffer_map} "
                 f"write_ranges={[(hex(addr), min(w), max(w), len(w)) for addr, w in observed_writes_by_instruction.items() if w]}"
             )
-        return function_name, difs
+        return function_name, frame_writes
+
+    @staticmethod
+    def __loop_write_leaves_object(memory_objects, address, length, previous):
+        """The object a store proves to be accessed out of bounds, or None.
+
+        A store is attributed to an object only through the store itself or
+        through the same instruction's previous store on the same path:
+
+        * the store straddles the object's boundary (one access covers bytes
+          inside and outside the object); or
+        * the instruction's previous store was inside the object and this store
+          continues the walk past its boundary: it is contiguous with (adjacent
+          to or overlapping) the previous one, or repeats the previous non-zero
+          stride when that stride is smaller than the object (array of structs
+          written field by field).
+
+        A single instruction that writes two unrelated locals (e.g. a helper
+        storing to a counter and to a buffer) produces neither pattern, so the
+        mere fact that an instruction's write set covers bytes inside and
+        outside an object is not used.
+        """
+        end = address + length
+        for owner, object_start, object_end in memory_objects:
+            if object_start <= address and end <= object_end:
+                continue
+            if address < object_end and end > object_start:
+                return owner, object_start, object_end
+            if previous is None:
+                continue
+            previous_address, previous_length, previous_stride = previous
+            previous_end = previous_address + previous_length
+            if not (previous_address < object_end and previous_end > object_start):
+                continue
+            contiguous = address <= previous_end and end >= previous_address
+            stride = address - previous_address
+            strided = (
+                stride != 0
+                and stride == previous_stride
+                and abs(stride) < object_end - object_start
+            )
+            if contiguous or strided:
+                return owner, object_start, object_end
+        return None
+
+    def __has_frame_pointer(self, function_addr):
+        """Whether the function sets up rbp as its frame pointer (push rbp; mov rbp, rsp).
+
+        rbp-relative facts (DWARF arrays, mapped buffers, pointer slots) can
+        only be placed in the concrete state of such a function.
+        """
+        try:
+            insns = self.project.factory.block(function_addr).capstone.insns
+        except Exception:
+            return False
+        names = [(ins.mnemonic, ins.op_str.replace(" ", "")) for ins in insns[:4] if ins.mnemonic != "endbr64"]
+        return len(names) >= 2 and names[0] == ("push", "rbp") and names[1] == ("mov", "rbp,rsp")
+
+    def __loop_memory_objects(self, function_name, function_addr, pre_loop_state, concrete_rbp, state, pointer_facts):
+        """Runtime address ranges of the objects a loop can write, with their owning frame.
+
+        * fixed arrays of the loop's own frame: DWARF arrays, or, for a
+          function without DWARF arrays, the buffers mapped from `lea` (bounded
+          by the nearest mapped local above, as in the static libc model);
+        * objects reached through pointer facts held in the loop function's rbp
+          slots or in globals: dynamic allocations (alloca) of any frame and
+          buffers of other (caller) frames.  The slot's value in the concrete
+          pre-loop state is the runtime address of the pointed-to byte.  The
+          emulation starts at the loop function's entry, so a pointer received
+          from a caller is unconstrained there; it is pinned to an address in a
+          disjoint region reserved for the owning frame, so that stores
+          through it can be mapped back to that frame.
+        """
+        objects = set()
+        has_frame_pointer = self.__has_frame_pointer(function_addr)
+        if has_frame_pointer:
+            dwarf_buffers = self._dwarf_buffers.get(function_name, ())
+            for offset, size in dwarf_buffers:
+                start = concrete_rbp + int(offset)
+                objects.add((function_name, start, start + int(size)))
+            if not dwarf_buffers and state.contains_stack_frame(function_name):
+                frame = state.get_stack_frame(function_name)
+                for key in frame.get_buffer_ids():
+                    if not isinstance(key, int) or key <= 0:
+                        continue
+                    buffer = self.__pointer_target_buffer(function_name, frame, -key)
+                    if buffer is not None and buffer[1] > 0:
+                        objects.add((function_name, concrete_rbp + buffer[0], concrete_rbp + buffer[0] + buffer[1]))
+        owner_regions = {}
+        for key, target in sorted(pointer_facts.items(), key=repr):
+            if not isinstance(key, tuple) or target is None:
+                continue
+            if key[0] == "slot" and key[1] == function_name and has_frame_pointer:
+                location = concrete_rbp + int(key[2])
+            elif key[0] == "global":
+                location = int(key[1])
+            else:
+                continue
+            owner, pointer_offset, alloca_size = target
+            if not state.contains_stack_frame(owner):
+                continue
+            if alloca_size is not None:
+                if not 0 <= pointer_offset < alloca_size:
+                    continue
+                relative_start, size = 0, int(alloca_size)
+            elif owner == function_name:
+                continue  # the frame's own arrays are placed from DWARF above
+            else:
+                buffer = self.__pointer_target_buffer(owner, state.get_stack_frame(owner), pointer_offset)
+                if buffer is None:
+                    continue
+                relative_start, size = buffer
+            if size <= 0:
+                continue
+            if owner not in owner_regions:
+                owner_regions[owner] = concrete_rbp + 0x100000 * (len(owner_regions) + 1)
+            pointer = self.__concrete_pointer(pre_loop_state, location, owner_regions[owner] + pointer_offset)
+            if pointer is None:
+                continue
+            base = pointer - pointer_offset
+            objects.add((owner, base + relative_start, base + relative_start + size))
+        return sorted(objects)
+
+    @staticmethod
+    def __concrete_pointer(state, location, preferred):
+        """Concrete value of the 8-byte pointer at `location`, pinning it to
+        `preferred` when the state does not determine it."""
+        try:
+            value = state.memory.load(location, 8, endness=state.arch.memory_endness)
+            if not value.symbolic:
+                return state.solver.eval(value)
+            if state.solver.unique(value):
+                return state.solver.eval(value)
+            constraint = value == preferred
+            if state.solver.satisfiable(extra_constraints=[constraint]):
+                state.add_constraints(constraint)
+                return preferred
+            pointer = state.solver.eval(value)
+            state.add_constraints(value == pointer)
+            return pointer
+        except Exception:
+            return None
 
     def stack_comparison(self, stack_before, stack_after):
 
