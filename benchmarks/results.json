@@ -1,0 +1,12 @@
+{
+  "Juliet CWE-121": {
+    "cases": 3524,
+    "errors": 0,
+    "TP": 900,
+    "FP": 145,
+    "TN": 1617,
+    "FN": 862,
+    "updated": "2026-10-04",
+    "source": "Computers & Security paper, Table \"Detection results on the Juliet CWE-121 dataset\""
+  }
+}
