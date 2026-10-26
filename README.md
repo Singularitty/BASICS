@@ -87,9 +87,9 @@ validation writes reports under `reports/<binary>/`.
 Current detection results on the Juliet C/C++ CWE121 dataset
 
 <!-- benchmark-table:start -->
-| Dataset | Cases | TP | FP | TN | FN | Precision | Recall | F1 | Accuracy | 
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Juliet CWE-121 | 3,524 | 900 (25.5%) | 145 (4.1%) | 1,617 (45.9%) | 862 (24.5%) | 86.1% | 51.1% | 64.1% | 71.4% | 
+| Cases | TP | FP | TN | FN | Precision | Recall | F1 | Accuracy | 
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 3,524 | 900 (25.5%) | 145 (4.1%) | 1,617 (45.9%) | 862 (24.5%) | 86.1% | 51.1% | 64.1% | 71.4% | 
 
 <!-- benchmark-table:end -->
 
