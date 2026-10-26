@@ -7,22 +7,24 @@ is mostly Python, with small C patch stubs under
 
 ## Setup
 
-Use Python 3.11. The pinned angr version in `requirements.txt` is not meant for
-newer Python releases.
-
-Choose one setup path.
-
-### Arch Linux
-
-On Arch, use the installer:
+The installer supports Arch-based and Debian/Ubuntu-based distributions:
 
 ```bash
-./install_arch.sh
+./install.sh
 ```
 
-The script uses `pacman`, sets up Python 3.11 through `pyenv` when needed,
-installs Spot when available, builds E9Patch under `.tools/e9patch`, creates
-`.venv`, installs the Python requirements, and compiles the patch stubs.
+It installs the system packages with `pacman` or `apt-get`, installs Spot (from
+the AUR on Arch, from the distribution or the LRDE apt repository on
+Debian/Ubuntu), builds E9Patch under `.tools/e9patch`, sets up Python 3.11 with
+`uv` under `.tools`, creates `.venv`, installs the Python requirements, and
+compiles the patch stubs. It can be rerun safely. Use `--skip-system` if the
+system packages are already installed and you do not want it to use `sudo`.
+
+BASICS needs Python 3.11, since the pinned angr version is not meant for newer
+releases. The installer takes care of this regardless of the system Python.
+
+If Spot cannot be installed, BASICS reuses the automata cached in
+`security_properties/`.
 
 After it finishes, either use the wrapper:
 
@@ -38,29 +40,14 @@ source .venv/bin/activate
 python src/main.py --help
 ```
 
-### Debian/Ubuntu or Manual Setup
+### Manual Setup
 
-There is no Debian/Ubuntu installer in this repo. Install the basic system
-packages yourself:
+On other distributions, install gcc, make, git, gdb, graphviz, patchelf, xxd,
+zlib headers and, optionally, Spot, then run `./install.sh --skip-system`.
 
-```bash
-sudo apt-get update
-sudo apt-get install -y graphviz gcc gdb git make patchelf python3.11 python3.11-venv
-```
-
-Then let the wrapper create the local Python environment:
-
-```bash
-PYTHON_BIN=python3.11 ./run_basics.sh --help
-```
-
-`run_basics.sh` creates `.venv`, installs `requirements.txt`, adds `.tools/bin`
-to `PATH`, and then forwards the remaining arguments to `src/main.py`.
-
-For patching runs, install E9Patch separately and put `e9tool` on `PATH`.
-Without it, the wrapper falls back to analysis-only mode. For LTL translation,
-install Spot or `ltl2ba`; if neither is available, BASICS reuses the checked-in
-automata cache.
+`run_basics.sh` can also create `.venv` from an existing Python 3.11 with
+`PYTHON_BIN=python3.11 ./run_basics.sh --help`. Without E9Patch (`e9tool` on
+`PATH`), it falls back to analysis-only mode.
 
 ## Run BASICS
 

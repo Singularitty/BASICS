@@ -1397,7 +1397,7 @@ def main():
     if not args.no_patching and shutil.which("e9tool") is None:
         raise RuntimeError(
             "Patching is enabled but e9tool is not available in PATH. "
-            "Install E9Patch (./install_arch.sh) and rerun with ./run_basics.sh, "
+            "Install E9Patch (./install.sh) and rerun with ./run_basics.sh, "
             "or pass --no-patching."
         )
 

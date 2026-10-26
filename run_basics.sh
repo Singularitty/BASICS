@@ -6,7 +6,7 @@ VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
 BASICS_PYTHON_VERSION="${BASICS_PYTHON_VERSION:-3.11.9}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 STAMP_FILE="$VENV_DIR/.requirements.stamp"
-REQUIREMENTS_FILE="$ROOT_DIR/requirements.txt"
+REQUIREMENTS_FILE="$ROOT_DIR/requirements.lock"
 
 export PATH="$ROOT_DIR/.tools/bin:$PATH"
 if [ -d "$HOME/Repos/e9patch" ]; then
@@ -42,21 +42,6 @@ EOF
     exit 1
 }
 
-PYTHON_CMD="$(select_python)"
-if [ "$PYTHON_CMD" = "pyenv exec python" ]; then
-    export PYENV_VERSION="$BASICS_PYTHON_VERSION"
-fi
-
-PYTHON_VERSION="$($PYTHON_CMD -c 'import sys; print("{}.{}".format(sys.version_info.major, sys.version_info.minor))')"
-if [ "$PYTHON_VERSION" != "3.11" ]; then
-    cat >&2 <<EOF
-Selected Python is $PYTHON_VERSION, but BASICS requires Python 3.11.
-
-Set PYTHON_BIN to a Python 3.11 interpreter or install pyenv.
-EOF
-    exit 1
-fi
-
 if [ -x "$VENV_DIR/bin/python" ]; then
     VENV_PYTHON_VERSION="$("$VENV_DIR/bin/python" -c 'import sys; print("{}.{}".format(sys.version_info.major, sys.version_info.minor))')"
     if [ "$VENV_PYTHON_VERSION" != "3.11" ]; then
@@ -65,7 +50,24 @@ if [ -x "$VENV_DIR/bin/python" ]; then
     fi
 fi
 
+# Only look for an interpreter when the venv has to be created, so a venv made
+# by install.sh (with a uv-managed Python) works without pyenv or python3.11.
 if [ ! -d "$VENV_DIR" ]; then
+    PYTHON_CMD="$(select_python)"
+    if [ "$PYTHON_CMD" = "pyenv exec python" ]; then
+        export PYENV_VERSION="$BASICS_PYTHON_VERSION"
+    fi
+
+    PYTHON_VERSION="$($PYTHON_CMD -c 'import sys; print("{}.{}".format(sys.version_info.major, sys.version_info.minor))')"
+    if [ "$PYTHON_VERSION" != "3.11" ]; then
+        cat >&2 <<EOF
+Selected Python is $PYTHON_VERSION, but BASICS requires Python 3.11.
+
+Run ./install.sh, or set PYTHON_BIN to a Python 3.11 interpreter.
+EOF
+        exit 1
+    fi
+
     $PYTHON_CMD -m venv "$VENV_DIR"
 fi
 
@@ -97,9 +99,7 @@ if [ "$LTL_BACKEND_RUNTIME" = "auto" ] && ! python -c "import spot" >/dev/null 2
     else
         cat >&2 <<EOF
 No LTL translator backend found.
-Install Spot (preferred) or ltl2ba.
-On Arch:
-  sudo pacman -S spot
+Install Spot (preferred) or ltl2ba, for example with ./install.sh.
 EOF
         exit 1
     fi
