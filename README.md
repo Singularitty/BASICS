@@ -82,53 +82,22 @@ Useful variants:
 Analysis starts at `main` unless `--analysis-entry loader` is used. Patch
 validation writes reports under `reports/<binary>/`.
 
-## Tests
 
-The unit tests are small enough to run locally:
+## Cite BASICS
 
-```bash
-python -m unittest discover -s tests
+If you use BASICS in your research, please cite us:
+
+```
+@article{FERREIRINHA2027105165,
+title = {BASICS: Binary Analysis and Stack Integrity Checker System for Buffer Overflow Mitigation},
+journal = {Computers & Security},
+volume = {172},
+pages = {105165},
+year = {2027},
+issn = {0167-4048},
+doi = {https://doi.org/10.1016/j.cose.2026.105165},
+url = {https://www.sciencedirect.com/science/article/pii/S016740482600341X},
+author = {Luís Ferreirinha and Ibéria Medeiros}
+}
 ```
 
-If fixture binaries need to be rebuilt:
-
-```bash
-./tests/build_c_cases.sh
-```
-
-## Reproduce Benchmarks
-
-The reproducibility wrapper records every command it runs under
-`Benchmarks/reproducibility/<run-id>/commands.log`.
-
-Show the full command sequence without running it:
-
-```bash
-python3 benchmarks/run_basics_repro.py --suite all --phase all --dry-run
-```
-
-Run a small stack-benchmark smoke test:
-
-```bash
-python3 benchmarks/run_basics_repro.py --suite stack --phase all --limit 5
-```
-
-Run the prepared SARD and Juliet stack manifests directly:
-
-```bash
-scripts/run_compiled_stack_benchmarks.sh all --jobs auto --timeout 180
-```
-
-For the focused Juliet OOM/error reruns:
-
-```bash
-scripts/run_juliet_oom_benchmarks.sh repro --prepare --jobs 1
-scripts/run_juliet_oom_benchmarks.sh direct-repro --timeout 1800
-```
-
-The OSS and Linux-package suites need network access and an Ubuntu-like host.
-They prepare binaries and manifests under `Benchmarks/` and write result CSV,
-JSON, and stats files next to each run.
-
-Generated benchmark corpora, scan reports, virtualenvs, downloaded tools, and
-result directories are intentionally left out of git.
